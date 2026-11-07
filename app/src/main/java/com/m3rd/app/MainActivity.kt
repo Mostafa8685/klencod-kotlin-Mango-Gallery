@@ -3734,10 +3734,8 @@ class MainActivity : Activity() {
 
         val infoTv = TextView(this).apply {
             val v = getVisibleMediaItems()
-            text = "إصدار احترافي فائق السرعة بهوية الزهرة الزرقاء الجديدة.
-" +
-                "إجمالي الوسائط على الهاتف: ${toArabicDigits(v.size)} عنصر
-" +
+            text = "إصدار احترافي فائق السرعة بهوية الزهرة الزرقاء الجديدة.\n" +
+                "إجمالي الوسائط على الهاتف: ${toArabicDigits(v.size)} عنصر\n" +
                 "الألبومات النشطة: ${toArabicDigits(buildAlbumsList().size)} ألبوم"
             textSize = 13.5f
             setTextColor(colorTextSecondary)
