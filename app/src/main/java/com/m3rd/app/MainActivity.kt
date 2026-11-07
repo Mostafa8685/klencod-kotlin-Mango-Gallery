@@ -26,6 +26,10 @@ import android.graphics.drawable.GradientDrawable
 import android.hardware.biometrics.BiometricPrompt
 import android.media.ExifInterface
 import android.media.MediaMetadataRetriever
+import android.media.MediaPlayer
+import android.media.PlaybackParams
+import android.view.animation.DecelerateInterpolator
+import android.widget.ImageView
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -131,9 +135,12 @@ class MainActivity : Activity() {
     private val colorTextMuted: Int
         get() = if (isDarkModeActive()) 0xFF8E8E93.toInt() else 0xFF76767E.toInt()
 
-    private val colorSamsungBlue = 0xFF3E82F7.toInt()
+    private val colorSamsungBlue = 0xFF0A78D6.toInt()
+    private val colorBrandIceBlue = 0xFF8CD0FA.toInt()
+    private val colorBrandLeafGreen = 0xFF5EA847.toInt()
     private val colorSamsungOrange = 0xFFE65A0F.toInt()
     private val colorDotOrange = 0xFFFF6D00.toInt()
+    private val smoothInterpolator = DecelerateInterpolator(1.6f)
 
     private val colorBorderSubtle: Int
         get() = if (isDarkModeActive()) 0xFF222226.toInt() else 0xFFDCDCE2.toInt()
@@ -180,6 +187,17 @@ class MainActivity : Activity() {
         var isFavorite: Boolean = false
     )
 
+    data class AudioTrack(
+        val id: String,
+        val title: String,
+        val artist: String,
+        val album: String,
+        val durationMs: Long,
+        val durationText: String,
+        val sizeBytes: Long,
+        val contentUri: Uri
+    )
+
     data class MenuOption(
         val label: String,
         val action: () -> Unit
@@ -203,6 +221,7 @@ class MainActivity : Activity() {
     private lateinit var prefs: SharedPreferences
     private lateinit var rootStack: FrameLayout
     private lateinit var mainContentArea: FrameLayout
+    private lateinit var miniAudioPlayerBar: LinearLayout
     private lateinit var bottomNavContainer: LinearLayout
     private lateinit var overlayLayer: FrameLayout
     private lateinit var lockLayer: FrameLayout
@@ -227,6 +246,7 @@ class MainActivity : Activity() {
     // التبويب الحالي: 0 = الصور، 1 = ألبومات، 2 = القصص
     private var currentTab = 0
     private var picturesColumnCount = 3
+    private var picturesQuickFilter = 0 // 0=الكل, 1=الصور فقط, 2=الفيديوهات, 3=المفضلة
 
     private var activeAlbumDetail: AlbumInfo? = null
     private var activeSubPageTitle: String? = null
@@ -246,8 +266,15 @@ class MainActivity : Activity() {
     private var isAlbumSelectionMode = false
     private val selectedAlbumIds = mutableSetOf<String>()
 
-    // قوائم صور وفيديوهات الهاتف الحقيقية فقط
+    // قوائم صور وفيديوهات وصوتيات الهاتف الحقيقية فقط
     private val deviceMediaItems = mutableListOf<MediaItem>()
+    private val deviceAudioTracks = mutableListOf<AudioTrack>()
+    private var audioPlayer: MediaPlayer? = null
+    private var currentAudioIndex = -1
+    private var isAudioPlaying = false
+    private var isAudioShuffle = false
+    private var isAudioRepeatOne = false
+    private var audioSpeed = 1.0f
     private var cachedVisibleItems: List<MediaItem> = emptyList()
     private val favoriteIds = mutableSetOf<String>()
     private val trashedIds = mutableSetOf<String>()
@@ -366,6 +393,20 @@ class MainActivity : Activity() {
             layoutDirection = View.LAYOUT_DIRECTION_LTR
         }
         mainVertical.addView(mainContentArea, LinearLayout.LayoutParams(-1, 0, 1f))
+
+        miniAudioPlayerBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+        mainVertical.addView(
+            miniAudioPlayerBar,
+            LinearLayout.LayoutParams(-1, -2).apply {
+                setMargins(dp(10), dp(2), dp(10), dp(4))
+            }
+        )
 
         bottomNavContainer = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -634,7 +675,8 @@ class MainActivity : Activity() {
         val needed = if (Build.VERSION.SDK_INT >= 33) {
             arrayOf(
                 Manifest.permission.READ_MEDIA_IMAGES,
-                Manifest.permission.READ_MEDIA_VIDEO
+                Manifest.permission.READ_MEDIA_VIDEO,
+                Manifest.permission.READ_MEDIA_AUDIO
             )
         } else {
             arrayOf(
@@ -850,11 +892,79 @@ class MainActivity : Activity() {
             } catch (_: Exception) {
             }
 
+            val loadedAudio = mutableListOf<AudioTrack>()
+            try {
+                val audProjection = arrayOf(
+                    MediaStore.Audio.Media._ID,
+                    MediaStore.Audio.Media.TITLE,
+                    MediaStore.Audio.Media.DISPLAY_NAME,
+                    MediaStore.Audio.Media.ARTIST,
+                    MediaStore.Audio.Media.ALBUM,
+                    MediaStore.Audio.Media.DURATION,
+                    MediaStore.Audio.Media.SIZE,
+                    MediaStore.Audio.Media.DATE_MODIFIED
+                )
+                contentResolver.query(
+                    MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                    audProjection,
+                    null,
+                    null,
+                    "${MediaStore.Audio.Media.DATE_MODIFIED} DESC"
+                )?.use { cursor ->
+                    val idCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
+                    val titleCol = cursor.getColumnIndex(MediaStore.Audio.Media.TITLE)
+                    val nameCol = cursor.getColumnIndex(MediaStore.Audio.Media.DISPLAY_NAME)
+                    val artistCol = cursor.getColumnIndex(MediaStore.Audio.Media.ARTIST)
+                    val albumCol = cursor.getColumnIndex(MediaStore.Audio.Media.ALBUM)
+                    val durCol = cursor.getColumnIndex(MediaStore.Audio.Media.DURATION)
+                    val sizeCol = cursor.getColumnIndex(MediaStore.Audio.Media.SIZE)
+
+                    while (cursor.moveToNext()) {
+                        val id = cursor.getLong(idCol)
+                        val rawTitle = (if (titleCol >= 0) cursor.getString(titleCol) else null)
+                            ?: (if (nameCol >= 0) cursor.getString(nameCol) else null)
+                            ?: "ملف صوتي $id"
+                        val rawArtist = (if (artistCol >= 0) cursor.getString(artistCol) else null)
+                            ?.takeIf { it != "<unknown>" } ?: "مقطع صوتي"
+                        val rawAlbum = (if (albumCol >= 0) cursor.getString(albumCol) else null)
+                            ?.takeIf { it != "<unknown>" } ?: "الصوتيات"
+                        val durMs = if (durCol >= 0) cursor.getLong(durCol) else 0L
+                        val sizeB = if (sizeCol >= 0) cursor.getLong(sizeCol) else 0L
+                        if (durMs >= 1000L || sizeB > 8192L) {
+                            val totalSec = (durMs / 1000L).coerceAtLeast(1L)
+                            val durFormatted = toArabicDigits(
+                                String.format(Locale.US, "%d:%02d", totalSec / 60, totalSec % 60)
+                            )
+                            val uri = ContentUris.withAppendedId(
+                                MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                                id
+                            )
+                            loadedAudio.add(
+                                AudioTrack(
+                                    id = "aud_$id",
+                                    title = rawTitle,
+                                    artist = rawArtist,
+                                    album = rawAlbum,
+                                    durationMs = durMs,
+                                    durationText = durFormatted,
+                                    sizeBytes = sizeB,
+                                    contentUri = uri
+                                )
+                            )
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+            }
+
             handler.post {
                 val changed = (loaded.size != deviceMediaItems.size) ||
-                    (loaded.firstOrNull()?.id != deviceMediaItems.firstOrNull()?.id)
+                    (loaded.firstOrNull()?.id != deviceMediaItems.firstOrNull()?.id) ||
+                    (loadedAudio.size != deviceAudioTracks.size)
                 deviceMediaItems.clear()
                 deviceMediaItems.addAll(loaded)
+                deviceAudioTracks.clear()
+                deviceAudioTracks.addAll(loadedAudio)
                 refreshCachedVisibleItems()
                 rebuildDynamicStoriesFromRealMedia()
                 if (changed || cachedVisibleItems.isEmpty()) {
@@ -1058,6 +1168,41 @@ class MainActivity : Activity() {
         }
     }
 
+    // ============================================================
+    // حركات انتقالية مسرّعة بالعتاد (Hardware-Accelerated Zero-Lag Animations)
+    // ============================================================
+    private fun animateFadeScaleIn(view: View, durationMs: Long = 140L) {
+        view.alpha = 0f
+        view.scaleX = 0.94f
+        view.scaleY = 0.94f
+        view.animate()
+            .alpha(1f)
+            .scaleX(1f)
+            .scaleY(1f)
+            .setDuration(durationMs)
+            .setInterpolator(smoothInterpolator)
+            .start()
+    }
+
+    private fun animateSlideUpIn(view: View, distanceDp: Int = 56, durationMs: Long = 165L) {
+        view.alpha = 0f
+        view.translationY = dpF(distanceDp.toFloat())
+        view.animate()
+            .alpha(1f)
+            .translationY(0f)
+            .setDuration(durationMs)
+            .setInterpolator(smoothInterpolator)
+            .start()
+    }
+
+    private fun createAppLogoBadge(sizeDp: Int): View {
+        return ImageView(this).apply {
+            setImageResource(R.drawable.app_icon)
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            layoutParams = LinearLayout.LayoutParams(dp(sizeDp), dp(sizeDp))
+        }
+    }
+
     private fun renderBottomNavigation() {
         bottomNavContainer.removeAllViews()
 
@@ -1166,23 +1311,30 @@ class MainActivity : Activity() {
         activeSelectAllTv = null
         mainContentArea.removeAllViews()
 
-        when {
+        val nextScreen = when {
             activeSubPageTitle != null -> {
-                mainContentArea.addView(buildSubPageScreen(activeSubPageTitle!!, activeSubPageItems ?: emptyList()))
+                buildSubPageScreen(activeSubPageTitle!!, activeSubPageItems ?: emptyList())
             }
             activeAlbumDetail != null -> {
-                mainContentArea.addView(buildAlbumDetailScreen(activeAlbumDetail!!))
+                buildAlbumDetailScreen(activeAlbumDetail!!)
             }
             currentTab == 0 -> {
-                mainContentArea.addView(buildPicturesTabScreen())
+                buildPicturesTabScreen()
             }
             currentTab == 1 -> {
-                mainContentArea.addView(buildAlbumsTabScreen())
+                buildAlbumsTabScreen()
             }
-            currentTab == 2 -> {
-                mainContentArea.addView(buildStoriesTabScreen())
+            else -> {
+                buildStoriesTabScreen()
             }
         }
+        nextScreen.alpha = 0f
+        mainContentArea.addView(nextScreen)
+        nextScreen.animate()
+            .alpha(1f)
+            .setDuration(115L)
+            .setInterpolator(smoothInterpolator)
+            .start()
     }
 
     // ============================================================
@@ -1250,8 +1402,116 @@ class MainActivity : Activity() {
             LinearLayout.LayoutParams(dp(40), dp(40)).apply { leftMargin = dp(4) }
         )
 
+        // زر تصغير/تكبير عدد الأعمدة السريع
+        val zoomColBtn = TextView(this).apply {
+            text = "${toArabicDigits(picturesColumnCount)}×"
+            textSize = 12f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(colorSamsungBlue)
+            gravity = Gravity.CENTER
+            setPadding(dp(10), dp(4), dp(10), dp(4))
+            background = GradientDrawable().apply {
+                setColor(colorCardDark)
+                cornerRadius = dpF(14f)
+                setStroke(dp(1), colorBorderSubtle)
+            }
+            setOnClickListener {
+                picturesColumnCount = when (picturesColumnCount) {
+                    2 -> 3
+                    3 -> 4
+                    4 -> 5
+                    else -> 2
+                }
+                savePersistedState()
+                renderActiveScreen()
+            }
+        }
+        normalTopBar.addView(
+            zoomColBtn,
+            LinearLayout.LayoutParams(-2, dp(30)).apply { leftMargin = dp(6) }
+        )
+
         normalTopBar.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+
+        // الهوية البصرية الجديدة: اسم الاستديو + اللوجو الأزرق الجديد في أقصى اليمين
+        val brandRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            isClickable = true
+            setOnClickListener { showAboutBrandDialog() }
+        }
+        val brandTitle = TextView(this).apply {
+            text = "الاستديو"
+            textSize = 19f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(colorTextPrimary)
+            setPadding(0, 0, dp(8), 0)
+        }
+        brandRow.addView(brandTitle)
+        brandRow.addView(createAppLogoBadge(28))
+        normalTopBar.addView(brandRow)
+
         wrapper.addView(normalTopBar, LinearLayout.LayoutParams(-1, -2))
+
+        // شريط الفلترة السريعة (الكل | الصور | مقاطع فيديو | المفضلة) بدون أي لاج
+        val filterScroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            visibility = if (isSelectionMode) View.GONE else View.VISIBLE
+        }
+        val filterRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(10), dp(2), dp(10), dp(8))
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+        }
+        val allItemsRaw = getVisibleMediaItems()
+        val vidCount = allItemsRaw.count { it.isVideo }
+        val imgCount = allItemsRaw.size - vidCount
+        val favCount = allItemsRaw.count { favoriteIds.contains(it.id) }
+
+        val filterDefs = listOf(
+            Pair("الكل (${toArabicDigits(allItemsRaw.size)})", 0),
+            Pair("الصور (${toArabicDigits(imgCount)})", 1),
+            Pair("فيديوهات (${toArabicDigits(vidCount)})", 2),
+            Pair("المفضلة (${toArabicDigits(favCount)})", 3),
+            Pair("🎵 الصوتيات (${toArabicDigits(deviceAudioTracks.size)})", 99)
+        )
+        for ((fText, fCode) in filterDefs) {
+            val active = (picturesQuickFilter == fCode)
+            val chip = TextView(this).apply {
+                text = fText
+                textSize = 12f
+                typeface = if (active) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+                setTextColor(if (active) Color.WHITE else colorTextSecondary)
+                setPadding(dp(13), dp(6), dp(13), dp(6))
+                background = GradientDrawable().apply {
+                    setColor(if (active) colorSamsungBlue else colorCardDark)
+                    cornerRadius = dpF(16f)
+                    setStroke(dp(1), if (active) colorSamsungBlue else colorBorderSubtle)
+                }
+                setOnClickListener {
+                    if (fCode == 99) {
+                        showProAudioPlayerOverlay()
+                    } else if (picturesQuickFilter != fCode) {
+                        picturesQuickFilter = fCode
+                        val filteredNow = when (picturesQuickFilter) {
+                            1 -> allItemsRaw.filter { !it.isVideo }
+                            2 -> allItemsRaw.filter { it.isVideo }
+                            3 -> allItemsRaw.filter { favoriteIds.contains(it.id) }
+                            else -> allItemsRaw
+                        }
+                        activePicturesAdapter?.updateData(buildPictureListRows(filteredNow, picturesColumnCount))
+                        renderActiveScreen()
+                    }
+                }
+            }
+            filterRow.addView(
+                chip,
+                LinearLayout.LayoutParams(-2, -2).apply { setMargins(dp(4), 0, dp(4), 0) }
+            )
+        }
+        filterScroll.addView(filterRow)
+        wrapper.addView(filterScroll, LinearLayout.LayoutParams(-1, -2))
 
         // شريط وضع التحديد العلوي
         val selectionTopBar = LinearLayout(this).apply {
@@ -1306,9 +1566,25 @@ class MainActivity : Activity() {
         selectionTopBar.addView(countTv, LinearLayout.LayoutParams(0, -2, 1f))
         wrapper.addView(selectionTopBar, LinearLayout.LayoutParams(-1, -2))
 
-        val visibleItems = getVisibleMediaItems()
-        if (visibleItems.isEmpty()) {
+        val rawVisible = getVisibleMediaItems()
+        if (rawVisible.isEmpty()) {
             wrapper.addView(buildEmptyOrPermissionPromptView(), LinearLayout.LayoutParams(-1, 0, 1f))
+            return wrapper
+        }
+        val visibleItems = when (picturesQuickFilter) {
+            1 -> rawVisible.filter { !it.isVideo }
+            2 -> rawVisible.filter { it.isVideo }
+            3 -> rawVisible.filter { favoriteIds.contains(it.id) }
+            else -> rawVisible
+        }
+        if (visibleItems.isEmpty()) {
+            val emptyFilterTv = TextView(this).apply {
+                text = "لا توجد عناصر في هذا التصنيف حالياً"
+                textSize = 15f
+                setTextColor(colorTextMuted)
+                gravity = Gravity.CENTER
+            }
+            wrapper.addView(emptyFilterTv, LinearLayout.LayoutParams(-1, 0, 1f))
             return wrapper
         }
 
@@ -1746,14 +2022,32 @@ class MainActivity : Activity() {
             layoutDirection = View.LAYOUT_DIRECTION_LTR
         }
 
+        val headerBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(0, dp(36), 0, dp(26))
+        }
+        headerBox.addView(createAppLogoBadge(44))
         val bigTitle = TextView(this).apply {
             text = "ألبومات"
-            textSize = 32f
+            textSize = 30f
+            typeface = Typeface.DEFAULT_BOLD
             setTextColor(colorWhite)
             gravity = Gravity.CENTER
-            setPadding(0, dp(52), 0, dp(38))
+            setPadding(0, dp(8), 0, dp(2))
         }
-        mainCol.addView(bigTitle, LinearLayout.LayoutParams(-1, -2))
+        headerBox.addView(bigTitle)
+        val totalSubtitle = TextView(this).apply {
+            val v = getVisibleMediaItems()
+            val vCount = v.count { it.isVideo }
+            val pCount = v.size - vCount
+            text = "${toArabicDigits(pCount)} صورة • ${toArabicDigits(vCount)} فيديو"
+            textSize = 12.5f
+            setTextColor(colorTextSecondary)
+            gravity = Gravity.CENTER
+        }
+        headerBox.addView(totalSubtitle)
+        mainCol.addView(headerBox, LinearLayout.LayoutParams(-1, -2))
 
         val actionRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -2498,7 +2792,13 @@ class MainActivity : Activity() {
             layoutDirection = View.LAYOUT_DIRECTION_LTR
         }
 
-        row2.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+        row2.addView(
+            makeHamburgerGridItem("مشغل الصوت", SamsungIconView.IconType.AUDIO_WAVE) {
+                closeOverlay()
+                showProAudioPlayerOverlay()
+            },
+            LinearLayout.LayoutParams(0, -2, 1f)
+        )
 
         row2.addView(
             makeHamburgerGridItem("الضبط", SamsungIconView.IconType.SETTINGS) {
@@ -2535,6 +2835,7 @@ class MainActivity : Activity() {
         }
         scrim.addView(card, cardLp)
         overlayLayer.addView(scrim, FrameLayout.LayoutParams(-1, -1))
+        animateSlideUpIn(card, distanceDp = 64, durationMs = 170L)
     }
 
     private fun makeHamburgerGridItem(
@@ -2614,6 +2915,7 @@ class MainActivity : Activity() {
         }
         scrim.addView(menuCard, lp)
         overlayLayer.addView(scrim, FrameLayout.LayoutParams(-1, -1))
+        animateFadeScaleIn(menuCard, durationMs = 135L)
     }
 
     private fun closeOverlay() {
@@ -2923,12 +3225,28 @@ class MainActivity : Activity() {
                 if (currentIndex < list.size - 1) {
                     currentIndex++
                     bindCurrentMediaToViewer()
+                    centerContainer.translationX = dpF(36f)
+                    centerContainer.alpha = 0.7f
+                    centerContainer.animate()
+                        .translationX(0f)
+                        .alpha(1f)
+                        .setDuration(130L)
+                        .setInterpolator(smoothInterpolator)
+                        .start()
                 }
             },
             onSwipePrev = {
                 if (currentIndex > 0) {
                     currentIndex--
                     bindCurrentMediaToViewer()
+                    centerContainer.translationX = -dpF(36f)
+                    centerContainer.alpha = 0.7f
+                    centerContainer.animate()
+                        .translationX(0f)
+                        .alpha(1f)
+                        .setDuration(130L)
+                        .setInterpolator(smoothInterpolator)
+                        .start()
                 }
             },
             onSwipeUpDetails = { showMediaDetailsSheet(list[currentIndex]) }
@@ -3051,24 +3369,14 @@ class MainActivity : Activity() {
 
             if (current.isVideo) {
                 playVideoOverlayBtn.visibility = View.VISIBLE
+                animateFadeScaleIn(playVideoOverlayBtn, 140L)
                 playVideoOverlayBtn.setOnClickListener {
                     playVideoOverlayBtn.visibility = View.GONE
-                    videoContainer.removeAllViews()
-                    videoContainer.visibility = View.VISIBLE
-                    val vv = VideoView(this@MainActivity).apply {
-                        setVideoURI(current.contentUri)
-                        val mc = MediaController(this@MainActivity)
-                        mc.setAnchorView(this)
-                        setMediaController(mc)
-                        setOnPreparedListener { mp ->
-                            mp.isLooping = true
-                            start()
-                        }
-                    }
-                    val vLp = FrameLayout.LayoutParams(-1, -1).apply {
-                        gravity = Gravity.CENTER
-                    }
-                    videoContainer.addView(vv, vLp)
+                    mountCustomProVideoPlayer(
+                        videoContainer = videoContainer,
+                        media = current,
+                        onToggleTopBar = { toggleBarsVisibility() }
+                    )
                 }
             } else {
                 playVideoOverlayBtn.visibility = View.GONE
@@ -3088,6 +3396,359 @@ class MainActivity : Activity() {
 
         bindCurrentMediaToViewer()
         overlayLayer.addView(root, FrameLayout.LayoutParams(-1, -1))
+    }
+
+    // ============================================================
+    // مشغل الفيديو الاحترافي المدمج (Samsung One UI Pro Video Player)
+    // يدعم: تقديم وتأخير، قفز ±10 ثوانٍ بالنقر المزدوج أو الأزرار، سرعة التشغيل (0.5x..2.0x)،
+    // كتم/تشغيل الصوت، تكرار الفيديو، والتقاط صورة فورية من الفيديو وحفظها!
+    // ============================================================
+    private fun mountCustomProVideoPlayer(
+        videoContainer: FrameLayout,
+        media: MediaItem,
+        onToggleTopBar: () -> Unit
+    ) {
+        videoContainer.removeAllViews()
+        videoContainer.visibility = View.VISIBLE
+        videoContainer.setBackgroundColor(Color.BLACK)
+
+        var mediaPlayerRef: MediaPlayer? = null
+        var isMuted = false
+        var isLoopingVideo = true
+        var currentSpeed = 1.0f
+        var controlsVisible = true
+        var isUserSeeking = false
+
+        val videoSurfaceWrap = FrameLayout(this).apply {
+            setBackgroundColor(Color.BLACK)
+        }
+        val videoView = VideoView(this).apply {
+            setVideoURI(media.contentUri)
+        }
+        val vLp = FrameLayout.LayoutParams(-1, -1).apply {
+            gravity = Gravity.CENTER
+        }
+        videoSurfaceWrap.addView(videoView, vLp)
+        videoContainer.addView(videoSurfaceWrap, FrameLayout.LayoutParams(-1, -1))
+
+        // شارة القفز السريع (±10 ثوانٍ) عند النقر المزدوج على يمين أو يسار الفيديو
+        val skipFeedbackBadge = TextView(this).apply {
+            text = ""
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            setPadding(dp(18), dp(10), dp(18), dp(10))
+            background = GradientDrawable().apply {
+                setColor(0xBB0A78D6.toInt())
+                cornerRadius = dpF(22f)
+            }
+            alpha = 0f
+        }
+        videoContainer.addView(
+            skipFeedbackBadge,
+            FrameLayout.LayoutParams(-2, -2).apply { gravity = Gravity.CENTER }
+        )
+
+        fun flashSkipBadge(text: String) {
+            skipFeedbackBadge.text = text
+            skipFeedbackBadge.alpha = 1f
+            skipFeedbackBadge.scaleX = 0.85f
+            skipFeedbackBadge.scaleY = 0.85f
+            skipFeedbackBadge.animate()
+                .alpha(0f)
+                .scaleX(1.08f)
+                .scaleY(1.08f)
+                .setDuration(520L)
+                .start()
+        }
+
+        // لوحة تحكم الفيديو العائمة بتصميم One UI
+        val controlsCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = GradientDrawable().apply {
+                setColor(0xD8141418.toInt())
+                cornerRadius = dpF(24f)
+                setStroke(dp(1), 0x44FFFFFF)
+            }
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+
+        // الصف الأول في لوحة التحكم: الوقت الحالي | شريط التمرير SeekBar | المدة الكلية
+        val seekRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val currentTimeTv = TextView(this).apply {
+            text = "٠:٠٠"
+            textSize = 11.5f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+        }
+        val totalTimeTv = TextView(this).apply {
+            text = media.durationText.ifEmpty { "٠:٠٠" }
+            textSize = 11.5f
+            setTextColor(0xFFCCCCCC.toInt())
+            gravity = Gravity.CENTER
+        }
+        val videoSeekBar = SeekBar(this).apply {
+            max = 1000
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                    if (fromUser) {
+                        val dur = videoView.duration.coerceAtLeast(1)
+                        val targetMs = (dur * progress) / 1000
+                        currentTimeTv.text = formatVideoTimeArabic(targetMs)
+                    }
+                }
+                override fun onStartTrackingTouch(sb: SeekBar?) {
+                    isUserSeeking = true
+                }
+                override fun onStopTrackingTouch(sb: SeekBar?) {
+                    val dur = videoView.duration.coerceAtLeast(1)
+                    val targetMs = (dur * (sb?.progress ?: 0)) / 1000
+                    videoView.seekTo(targetMs)
+                    isUserSeeking = false
+                }
+            })
+        }
+        seekRow.addView(currentTimeTv, LinearLayout.LayoutParams(dp(44), -2))
+        seekRow.addView(videoSeekBar, LinearLayout.LayoutParams(0, -2, 1f))
+        seekRow.addView(totalTimeTv, LinearLayout.LayoutParams(dp(44), -2))
+        controlsCard.addView(seekRow, LinearLayout.LayoutParams(-1, -2))
+
+        // الصف الثاني: أزرار التحكم (كتم الصوت | -10ث | تشغيل/إيقاف | +10ث | السرعة | لقطة شاشة)
+        val btnRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(6), 0, 0)
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+
+        val muteBtn = makeVideoPillButton("🔊") {}
+        muteBtn.setOnClickListener {
+            isMuted = !isMuted
+            try {
+                val vol = if (isMuted) 0f else 1f
+                mediaPlayerRef?.setVolume(vol, vol)
+            } catch (_: Exception) {}
+            muteBtn.text = if (isMuted) "🔇" else "🔊"
+        }
+
+        val rwBtn = makeVideoPillButton("⏪ ١٠ث") {
+            val nextPos = (videoView.currentPosition - 10_000).coerceAtLeast(0)
+            videoView.seekTo(nextPos)
+            flashSkipBadge("⏪ -١٠ ثوانٍ")
+        }
+
+        val playPauseBtn = TextView(this).apply {
+            text = "⏸"
+            textSize = 18f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(colorSamsungBlue)
+            }
+            setOnClickListener {
+                if (videoView.isPlaying) {
+                    videoView.pause()
+                    text = "▶"
+                } else {
+                    videoView.start()
+                    text = "⏸"
+                }
+            }
+        }
+
+        val ffBtn = makeVideoPillButton("١٠ث ⏩") {
+            val dur = videoView.duration.coerceAtLeast(1)
+            val nextPos = (videoView.currentPosition + 10_000).coerceAtMost(dur)
+            videoView.seekTo(nextPos)
+            flashSkipBadge("+١٠ ثوانٍ ⏩")
+        }
+
+        val speedBtn = makeVideoPillButton("1.0x") {}
+        speedBtn.setOnClickListener {
+            currentSpeed = when (currentSpeed) {
+                1.0f -> 1.5f
+                1.5f -> 2.0f
+                2.0f -> 0.5f
+                else -> 1.0f
+            }
+            speedBtn.text = "${currentSpeed}x"
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                try {
+                    val mp = mediaPlayerRef
+                    if (mp != null) {
+                        mp.playbackParams = (mp.playbackParams ?: PlaybackParams()).setSpeed(currentSpeed)
+                    }
+                } catch (_: Exception) {}
+            }
+        }
+
+        val captureBtn = makeVideoPillButton("📸 لقطة") {
+            val posUs = videoView.currentPosition.toLong() * 1000L
+            viewerExecutor.execute {
+                val retriever = MediaMetadataRetriever()
+                try {
+                    retriever.setDataSource(this@MainActivity, media.contentUri)
+                    val frameBmp = retriever.getFrameAtTime(posUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                        ?: retriever.getFrameAtTime(posUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    if (frameBmp != null) {
+                        handler.post {
+                            saveEditedPhotoToDevice(frameBmp)
+                        }
+                    }
+                } catch (_: Exception) {
+                } finally {
+                    try { retriever.release() } catch (_: Exception) {}
+                }
+            }
+        }
+
+        btnRow.addView(muteBtn, LinearLayout.LayoutParams(0, dp(36), 0.9f).apply { rightMargin = dp(4) })
+        btnRow.addView(rwBtn, LinearLayout.LayoutParams(0, dp(36), 1.1f).apply { rightMargin = dp(4) })
+        btnRow.addView(playPauseBtn, LinearLayout.LayoutParams(dp(44), dp(44)).apply { setMargins(dp(4), 0, dp(4), 0) })
+        btnRow.addView(ffBtn, LinearLayout.LayoutParams(0, dp(36), 1.1f).apply { leftMargin = dp(4) })
+        btnRow.addView(speedBtn, LinearLayout.LayoutParams(0, dp(36), 0.9f).apply { leftMargin = dp(4) })
+        btnRow.addView(captureBtn, LinearLayout.LayoutParams(0, dp(36), 1.2f).apply { leftMargin = dp(4) })
+
+        controlsCard.addView(btnRow, LinearLayout.LayoutParams(-1, -2))
+
+        val cardLp = FrameLayout.LayoutParams(-1, -2).apply {
+            gravity = Gravity.BOTTOM
+            leftMargin = dp(12)
+            rightMargin = dp(12)
+            bottomMargin = dp(74)
+        }
+        videoContainer.addView(controlsCard, cardLp)
+        animateSlideUpIn(controlsCard, distanceDp = 40, durationMs = 160L)
+
+        // إيماءات اللمس على شاشة الفيديو: نقر فردي لإخفاء/إظهار التحكم، نقر مزدوج يمين/يسار للقفز ±10 ثوانٍ
+        val videoGesture = GestureDetector(
+            this,
+            object : GestureDetector.SimpleOnGestureListener() {
+                override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+                    controlsVisible = !controlsVisible
+                    controlsCard.visibility = if (controlsVisible) View.VISIBLE else View.GONE
+                    onToggleTopBar()
+                    return true
+                }
+
+                override fun onDoubleTap(e: MotionEvent): Boolean {
+                    val w = videoSurfaceWrap.width.coerceAtLeast(1)
+                    if (e.x < w * 0.45f) {
+                        val nextPos = (videoView.currentPosition - 10_000).coerceAtLeast(0)
+                        videoView.seekTo(nextPos)
+                        flashSkipBadge("⏪ -١٠ ثوانٍ")
+                    } else if (e.x > w * 0.55f) {
+                        val dur = videoView.duration.coerceAtLeast(1)
+                        val nextPos = (videoView.currentPosition + 10_000).coerceAtMost(dur)
+                        videoView.seekTo(nextPos)
+                        flashSkipBadge("+١٠ ثوانٍ ⏩")
+                    } else {
+                        if (videoView.isPlaying) {
+                            videoView.pause()
+                            playPauseBtn.text = "▶"
+                        } else {
+                            videoView.start()
+                            playPauseBtn.text = "⏸"
+                        }
+                    }
+                    return true
+                }
+            }
+        )
+        videoSurfaceWrap.setOnTouchListener { _, ev ->
+            videoGesture.onTouchEvent(ev)
+            true
+        }
+
+        // تحديث شريط التقدم كل 250ms بدون أي حمل على المعالج
+        val progressUpdater = object : Runnable {
+            override fun run() {
+                if (videoContainer.visibility != View.VISIBLE || !videoContainer.isAttachedToWindow) return
+                try {
+                    if (videoView.isPlaying && !isUserSeeking) {
+                        val pos = videoView.currentPosition
+                        val dur = videoView.duration.coerceAtLeast(1)
+                        currentTimeTv.text = formatVideoTimeArabic(pos)
+                        totalTimeTv.text = formatVideoTimeArabic(dur)
+                        videoSeekBar.progress = ((pos.toLong() * 1000L) / dur).toInt().coerceIn(0, 1000)
+                    }
+                } catch (_: Exception) {}
+                handler.postDelayed(this, 250L)
+            }
+        }
+
+        videoView.setOnPreparedListener { mp ->
+            mediaPlayerRef = mp
+            mp.isLooping = isLoopingVideo
+            totalTimeTv.text = formatVideoTimeArabic(videoView.duration)
+            videoView.start()
+            playPauseBtn.text = "⏸"
+            handler.post(progressUpdater)
+        }
+    }
+
+    private fun makeVideoPillButton(label: String, onClick: () -> Unit): TextView {
+        return TextView(this).apply {
+            text = label
+            textSize = 11f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                setColor(0xFF282830.toInt())
+                cornerRadius = dpF(14f)
+            }
+            setOnClickListener { onClick() }
+        }
+    }
+
+    private fun formatVideoTimeArabic(ms: Int): String {
+        val totalSec = (ms / 1000).coerceAtLeast(0)
+        val mins = totalSec / 60
+        val secs = totalSec % 60
+        return toArabicDigits(String.format(Locale.US, "%d:%02d", mins, secs))
+    }
+
+    private fun showAboutBrandDialog() {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(24), dp(22), dp(24), dp(14))
+        }
+        box.addView(createAppLogoBadge(72))
+        val titleTv = TextView(this).apply {
+            text = "استديو سامسونج (One UI Gallery)"
+            textSize = 17f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(colorTextPrimary)
+            gravity = Gravity.CENTER
+        }
+        box.addView(titleTv, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
+
+        val infoTv = TextView(this).apply {
+            val v = getVisibleMediaItems()
+            text = "إصدار احترافي فائق السرعة بهوية الزهرة الزرقاء الجديدة.
+" +
+                "إجمالي الوسائط على الهاتف: ${toArabicDigits(v.size)} عنصر
+" +
+                "الألبومات النشطة: ${toArabicDigits(buildAlbumsList().size)} ألبوم"
+            textSize = 13.5f
+            setTextColor(colorTextSecondary)
+            gravity = Gravity.CENTER
+        }
+        box.addView(infoTv, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+
+        AlertDialog.Builder(this)
+            .setView(box)
+            .setPositiveButton("حسناً", null)
+            .show()
     }
 
     private fun showViewerMoreMenu(media: MediaItem, onRefresh: () -> Unit) {
@@ -3203,6 +3864,9 @@ class MainActivity : Activity() {
     // ============================================================
     // محرر صور سامسونج اليدوي المتكامل (Samsung One UI Pro Photo Editor)
     // ============================================================
+    // ============================================================
+    // محرر صور سامسونج الاحترافي المطابق للقطات المرفقة (1000036296..1000036301) بهوية الزهرة الزرقاء
+    // ============================================================
     private fun showSamsungProPhotoEditor(media: MediaItem) {
         overlayLayer.removeAllViews()
         overlayLayer.visibility = View.VISIBLE
@@ -3215,7 +3879,17 @@ class MainActivity : Activity() {
         }
 
         val editorCanvasView = SamsungManualEditorCanvasView(this, fullBitmap)
-        var currentEditorTab = 0 // 0=قص وتدوير, 1=إضاءة وألوان, 2=فلاتر, 3=رسم, 4=نص
+        val filterThumbBmp = Bitmap.createScaledBitmap(fullBitmap, 140, 140, true)
+        // التبويبات السفلية الخمسة من اليمين لليسار كما في صور سامسونج:
+        // 0 = القص والتدوير والمنظور (1000036296)
+        // 1 = الفلاتر الحيّة (1000036297)
+        // 2 = الإضاءة والدرجات اللونية (1000036298)
+        // 3 = الرسم والملصقات والنص (1000036300)
+        // 4 = الأدوات المتقدمة: تحديد حر / لون البقعة / مزيج الألوان (1000036301)
+        var currentEditorTab = 0
+        var activeTransformSubMode = 0 // 0=تسوية, 1=منظور أفقي, 2=منظور عمودي
+        var activeToneSubMode = 0 // 0=السطوع, 1=التعريض, 2=التباين, 3=التشبع, 4=الدفء
+        var activeDecorSubMode = 0 // 0=الرسم, 1=ملصقات, 2=النص
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -3223,430 +3897,706 @@ class MainActivity : Activity() {
             layoutDirection = View.LAYOUT_DIRECTION_LTR
         }
 
+        // الشريط العلوي المطابق للقطات سامسونج:
+        // يسار الشاشة: [ ⋮ ] [ حفظ ] [ إرجاع ]  <--->  يمين الشاشة: الدائرتان [ ↶ ] [ ↷ ]
         val topBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(12), dp(12), dp(12), dp(10))
-            setBackgroundColor(0xFF141416.toInt())
+            setPadding(dp(12), dp(14), dp(14), dp(10))
+            setBackgroundColor(0xFF000000.toInt())
             layoutDirection = View.LAYOUT_DIRECTION_LTR
         }
 
-        val saveBtn = TextView(this).apply {
+        val moreEditBtn = makeTopIconButton(SamsungIconView.IconType.MORE_VERT, Color.WHITE) {
+            val opts = arrayOf("حفظ كنسخة جديدة", "استعادة الأصل", "تفاصيل الصورة")
+            AlertDialog.Builder(this)
+                .setTitle("خيارات المحرر")
+                .setItems(opts) { _, which ->
+                    when (which) {
+                        0 -> saveEditedPhotoToDevice(editorCanvasView.renderFinalEditedBitmap())
+                        1 -> editorCanvasView.resetAllEdits()
+                        2 -> showMediaDetailsSheet(media)
+                    }
+                }
+                .show()
+        }
+        topBar.addView(moreEditBtn, LinearLayout.LayoutParams(dp(36), dp(36)))
+
+        val saveTv = TextView(this).apply {
             text = "حفظ"
-            textSize = 14.5f
+            textSize = 16.5f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.WHITE)
-            setPadding(dp(16), dp(7), dp(16), dp(7))
-            background = GradientDrawable().apply {
-                setColor(colorSamsungBlue)
-                cornerRadius = dpF(16f)
-            }
+            setPadding(dp(12), dp(6), dp(12), dp(6))
             setOnClickListener {
                 val outBmp = editorCanvasView.renderFinalEditedBitmap()
                 saveEditedPhotoToDevice(outBmp)
             }
         }
-        topBar.addView(saveBtn)
+        topBar.addView(saveTv)
 
-        val resetBtn = TextView(this).apply {
+        val revertTv = TextView(this).apply {
             text = "إرجاع"
-            textSize = 13.5f
-            setTextColor(0xFFCCCCCC.toInt())
+            textSize = 16.5f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(0xFFD0D0D6.toInt())
             setPadding(dp(12), dp(6), dp(12), dp(6))
             setOnClickListener {
                 editorCanvasView.resetAllEdits()
-                Toast.makeText(this@MainActivity, "تمت استعادة الصورة الأصلية", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@MainActivity, "تم إرجاع الصورة للأصل", Toast.LENGTH_SHORT).show()
             }
         }
-        topBar.addView(resetBtn)
-
-        val undoBtn = TextView(this).apply {
-            text = "تراجع ↶"
-            textSize = 13.5f
-            setTextColor(Color.WHITE)
-            setPadding(dp(10), dp(6), dp(10), dp(6))
-            setOnClickListener { editorCanvasView.undoLastStrokeOrText() }
-        }
-        topBar.addView(undoBtn)
+        topBar.addView(revertTv)
 
         topBar.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
 
-        val cancelBtn = TextView(this).apply {
-            text = "إلغاء"
-            textSize = 14f
-            setTextColor(Color.WHITE)
-            setPadding(dp(12), dp(6), dp(6), dp(6))
-            setOnClickListener { showFullScreenPhotoViewer(media) }
+        // أزرار التراجع والإعادة الدائرية على اليمين كما في 1000036298.png
+        val undoCircle = FrameLayout(this).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(0xFF1E1E22.toInt())
+            }
+            setOnClickListener { editorCanvasView.undoLastStrokeOrText() }
         }
-        topBar.addView(cancelBtn)
+        val undoIcon = SamsungIconView(this, SamsungIconView.IconType.UNDO_CURVE, 0xFFAEAEB2.toInt(), 1.9f)
+        undoCircle.addView(undoIcon, FrameLayout.LayoutParams(dp(18), dp(18)).apply { gravity = Gravity.CENTER })
+        topBar.addView(undoCircle, LinearLayout.LayoutParams(dp(36), dp(36)).apply { rightMargin = dp(8) })
+
+        val redoCircle = FrameLayout(this).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(0xFF1E1E22.toInt())
+            }
+            setOnClickListener { shareMediaItem(media) }
+        }
+        val redoIcon = SamsungIconView(this, SamsungIconView.IconType.REDO_CURVE, Color.WHITE, 1.9f)
+        redoCircle.addView(redoIcon, FrameLayout.LayoutParams(dp(18), dp(18)).apply { gravity = Gravity.CENTER })
+        topBar.addView(redoCircle, LinearLayout.LayoutParams(dp(36), dp(36)))
 
         root.addView(topBar, LinearLayout.LayoutParams(-1, -2))
+
+        // مساحة الصورة في المنتصف
         root.addView(editorCanvasView, LinearLayout.LayoutParams(-1, 0, 1f))
 
-        val toolPanelContainer = FrameLayout(this).apply {
-            setBackgroundColor(0xFF161618.toInt())
-            setPadding(dp(12), dp(10), dp(12), dp(10))
+        // منطقة الأدوات الديناميكية فوق شريط الأيقونات الخمسة
+        val dynamicToolArea = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setBackgroundColor(0xFF000000.toInt())
+            setPadding(dp(8), dp(6), dp(8), dp(8))
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
         }
-        root.addView(toolPanelContainer, LinearLayout.LayoutParams(-1, -2))
+        root.addView(dynamicToolArea, LinearLayout.LayoutParams(-1, -2))
 
-        val bottomTabRow = LinearLayout(this).apply {
+        // شريط الأيقونات الخمسة السفلي (1000036296..1000036301)
+        val bottomIconsBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(0xFF0E0E10.toInt())
-            setPadding(dp(6), dp(8), dp(6), dp(10))
-            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            setBackgroundColor(0xFF000000.toInt())
+            setPadding(dp(18), dp(8), dp(18), dp(14))
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
         }
+        root.addView(bottomIconsBar, LinearLayout.LayoutParams(-1, -2))
 
-        fun rebuildEditorToolPanel() {
-            toolPanelContainer.removeAllViews()
+        fun rebuildSamsungEditorUI() {
+            dynamicToolArea.removeAllViews()
             editorCanvasView.isCropModeActive = (currentEditorTab == 0)
-            editorCanvasView.isDrawingModeActive = (currentEditorTab == 3)
+            editorCanvasView.isDrawingModeActive = (currentEditorTab == 3 && activeDecorSubMode == 0)
             editorCanvasView.invalidate()
 
             when (currentEditorTab) {
                 0 -> {
-                    val col = LinearLayout(this).apply {
-                        orientation = LinearLayout.VERTICAL
-                    }
-
-                    val angleRow = LinearLayout(this).apply {
+                    // ====================================================
+                    // التبويب 0: القص والتدوير والتسوية (مطابق للصورة 1000036296.png)
+                    // ====================================================
+                    // 1. الكبسولة الصغيرة [ Free | ↻ | ‹|› ]
+                    val miniPill = LinearLayout(this).apply {
                         orientation = LinearLayout.HORIZONTAL
                         gravity = Gravity.CENTER_VERTICAL
+                        setPadding(dp(12), dp(6), dp(12), dp(6))
+                        background = GradientDrawable().apply {
+                            setColor(0xFF121214.toInt())
+                            cornerRadius = dpF(18f)
+                            setStroke(dp(1), 0xFF2C2C30.toInt())
+                        }
                     }
-                    val angleValTv = TextView(this).apply {
-                        text = "${toArabicDigits(editorCanvasView.fineAngleDeg.roundToInt())}°"
-                        textSize = 12f
+
+                    val ratioBtn = TextView(this).apply {
+                        text = "Free"
+                        textSize = 11f
+                        typeface = Typeface.DEFAULT_BOLD
                         setTextColor(Color.WHITE)
-                        gravity = Gravity.CENTER
+                        setPadding(dp(10), dp(2), dp(10), dp(2))
+                        setOnClickListener {
+                            val rNames = arrayOf("حر (Free)", "1:1 مربع", "4:3", "3:4", "16:9", "تطبيق القص الآن ✂")
+                            AlertDialog.Builder(this@MainActivity)
+                                .setTitle("نسبة القص")
+                                .setItems(rNames) { _, w ->
+                                    when (w) {
+                                        0 -> editorCanvasView.setCropAspectRatio(0f)
+                                        1 -> editorCanvasView.setCropAspectRatio(1f)
+                                        2 -> editorCanvasView.setCropAspectRatio(4f / 3f)
+                                        3 -> editorCanvasView.setCropAspectRatio(3f / 4f)
+                                        4 -> editorCanvasView.setCropAspectRatio(16f / 9f)
+                                        5 -> editorCanvasView.applyCropNow()
+                                    }
+                                }
+                                .show()
+                        }
                     }
-                    val angleSeek = SeekBar(this).apply {
-                        max = 90
-                        progress = (editorCanvasView.fineAngleDeg + 45f).roundToInt().coerceIn(0, 90)
-                        setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                            override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                                editorCanvasView.fineAngleDeg = (p - 45).toFloat()
-                                angleValTv.text = "${toArabicDigits(p - 45)}°"
-                                editorCanvasView.invalidate()
-                            }
-                            override fun onStartTrackingTouch(sb: SeekBar?) {}
-                            override fun onStopTrackingTouch(sb: SeekBar?) {}
-                        })
+                    val rotBtn = TextView(this).apply {
+                        text = "↺"
+                        textSize = 15f
+                        setTextColor(Color.WHITE)
+                        setPadding(dp(14), 0, dp(14), 0)
+                        setOnClickListener { editorCanvasView.rotate90() }
                     }
-                    val angleLabel = TextView(this).apply {
-                        text = "الميلان"
+                    val flipBtn = TextView(this).apply {
+                        text = "‹|›"
+                        textSize = 13f
+                        setTextColor(Color.WHITE)
+                        setPadding(dp(10), 0, dp(10), 0)
+                        setOnClickListener { editorCanvasView.flipHorizontal() }
+                    }
+                    miniPill.addView(ratioBtn)
+                    miniPill.addView(rotBtn)
+                    miniPill.addView(flipBtn)
+                    dynamicToolArea.addView(
+                        miniPill,
+                        LinearLayout.LayoutParams(-2, -2).apply { bottomMargin = dp(12) }
+                    )
+
+                    // 2. عنوان الأداة النشطة ("تسوية" / "منظور أفقي" / "منظور عمودي")
+                    val modeTitles = arrayOf("تسوية", "منظور أفقي", "منظور عمودي")
+                    val modeLabelTv = TextView(this).apply {
+                        text = modeTitles[activeTransformSubMode]
                         textSize = 12f
-                        setTextColor(0xFFCCCCCC.toInt())
+                        setTextColor(0xFFE5E5EA.toInt())
+                        gravity = Gravity.CENTER
                     }
-                    angleRow.addView(angleValTv, LinearLayout.LayoutParams(dp(42), -2))
-                    angleRow.addView(angleSeek, LinearLayout.LayoutParams(0, -2, 1f))
-                    angleRow.addView(angleLabel, LinearLayout.LayoutParams(-2, -2))
-                    col.addView(angleRow, LinearLayout.LayoutParams(-1, -2))
+                    dynamicToolArea.addView(
+                        modeLabelTv,
+                        LinearLayout.LayoutParams(-2, -2).apply { bottomMargin = dp(10) }
+                    )
 
-                    val transformRow = LinearLayout(this).apply {
+                    // 3. الدوائر الثلاث الكبيرة (1000036296.png)
+                    val circlesRow = LinearLayout(this).apply {
                         orientation = LinearLayout.HORIZONTAL
                         gravity = Gravity.CENTER
-                        layoutDirection = View.LAYOUT_DIRECTION_RTL
+                        layoutDirection = View.LAYOUT_DIRECTION_LTR
                     }
-                    val btns = listOf(
-                        MenuOption("تدوير 90° ↻") { editorCanvasView.rotate90() },
-                        MenuOption("قلب أفقي ⇄") { editorCanvasView.flipHorizontal() },
-                        MenuOption("قلب عمودي ⇅") { editorCanvasView.flipVertical() },
-                        MenuOption("تطبيق القص ✂") {
-                            editorCanvasView.applyCropNow()
-                            Toast.makeText(this@MainActivity, "تم قص الصورة", Toast.LENGTH_SHORT).show()
-                        }
+                    val transformIcons = arrayOf(
+                        SamsungIconView.IconType.PERSP_VERTICAL,
+                        SamsungIconView.IconType.PERSP_HORIZONTAL,
+                        SamsungIconView.IconType.STRAIGHTEN_TILT
                     )
-                    for ((lbl, act) in btns) {
-                        val b = TextView(this).apply {
-                            text = lbl
-                            textSize = 12f
-                            typeface = Typeface.DEFAULT_BOLD
-                            setTextColor(Color.WHITE)
-                            gravity = Gravity.CENTER
-                            setPadding(dp(10), dp(8), dp(10), dp(8))
+                    val transformIndices = intArrayOf(2, 1, 0)
+                    for (k in 0..2) {
+                        val subIdx = transformIndices[k]
+                        val isSel = (activeTransformSubMode == subIdx)
+                        val circle = FrameLayout(this).apply {
                             background = GradientDrawable().apply {
-                                setColor(if (lbl.contains("تطبيق")) colorSamsungBlue else 0xFF28282C.toInt())
-                                cornerRadius = dpF(14f)
+                                shape = GradientDrawable.OVAL
+                                setColor(if (isSel) Color.WHITE else 0xFF1E1E22.toInt())
                             }
-                            setOnClickListener { act() }
+                            setOnClickListener {
+                                activeTransformSubMode = subIdx
+                                rebuildSamsungEditorUI()
+                            }
                         }
-                        transformRow.addView(
-                            b,
-                            LinearLayout.LayoutParams(0, -2, 1f).apply {
-                                setMargins(dp(3), dp(8), dp(3), dp(4))
-                            }
+                        val ic = SamsungIconView(
+                            this,
+                            transformIcons[k],
+                            if (isSel) Color.BLACK else Color.WHITE,
+                            1.8f
+                        )
+                        circle.addView(ic, FrameLayout.LayoutParams(dp(22), dp(22)).apply { gravity = Gravity.CENTER })
+                        circlesRow.addView(
+                            circle,
+                            LinearLayout.LayoutParams(dp(54), dp(54)).apply { setMargins(dp(8), 0, dp(8), 0) }
                         )
                     }
-                    col.addView(transformRow, LinearLayout.LayoutParams(-1, -2))
-
-                    val ratioRow = LinearLayout(this).apply {
-                        orientation = LinearLayout.HORIZONTAL
-                        gravity = Gravity.CENTER
-                        layoutDirection = View.LAYOUT_DIRECTION_RTL
-                    }
-                    val ratios = listOf(
-                        Pair("حر", 0f),
-                        Pair("1:1 مربع", 1f),
-                        Pair("4:3", 4f / 3f),
-                        Pair("3:4", 3f / 4f),
-                        Pair("16:9", 16f / 9f)
+                    dynamicToolArea.addView(
+                        circlesRow,
+                        LinearLayout.LayoutParams(-2, -2).apply { bottomMargin = dp(12) }
                     )
-                    for ((rName, rVal) in ratios) {
-                        val chip = TextView(this).apply {
-                            text = rName
-                            textSize = 11.5f
-                            setTextColor(0xFFE5E5EA.toInt())
-                            gravity = Gravity.CENTER
-                            setPadding(dp(10), dp(5), dp(10), dp(5))
-                            background = GradientDrawable().apply {
-                                setColor(0xFF222226.toInt())
-                                cornerRadius = dpF(12f)
-                            }
-                            setOnClickListener { editorCanvasView.setCropAspectRatio(rVal) }
-                        }
-                        ratioRow.addView(
-                            chip,
-                            LinearLayout.LayoutParams(-2, -2).apply { setMargins(dp(4), dp(4), dp(4), 0) }
-                        )
-                    }
-                    col.addView(ratioRow, LinearLayout.LayoutParams(-1, -2))
 
-                    toolPanelContainer.addView(col, FrameLayout.LayoutParams(-1, -2))
+                    // 4. مسطرة التدريج التفاعلية باللمس (Samsung Tick-Mark Ruler Dial)
+                    val ruler = SamsungTickRulerView(
+                        context = this,
+                        minVal = -45f,
+                        maxVal = 45f,
+                        initialVal = editorCanvasView.fineAngleDeg,
+                        accentColor = colorBrandIceBlue
+                    ) { newAngle ->
+                        editorCanvasView.fineAngleDeg = newAngle
+                        modeLabelTv.text = "${modeTitles[activeTransformSubMode]}  ${toArabicDigits(newAngle.roundToInt())}°"
+                        editorCanvasView.invalidate()
+                    }
+                    dynamicToolArea.addView(ruler, LinearLayout.LayoutParams(-1, dp(42)))
                 }
 
                 1 -> {
-                    val col = LinearLayout(this).apply {
-                        orientation = LinearLayout.VERTICAL
-                    }
-
-                    fun addToneSlider(
-                        label: String,
-                        initialVal: Int,
-                        onChange: (Int) -> Unit
-                    ) {
-                        val row = LinearLayout(this).apply {
-                            orientation = LinearLayout.HORIZONTAL
-                            gravity = Gravity.CENTER_VERTICAL
-                            setPadding(0, dp(3), 0, dp(3))
-                        }
-                        val valTv = TextView(this).apply {
-                            text = toArabicDigits(initialVal)
-                            textSize = 11.5f
-                            setTextColor(Color.WHITE)
-                            gravity = Gravity.CENTER
-                        }
-                        val seek = SeekBar(this).apply {
-                            max = 200
-                            progress = (initialVal + 100).coerceIn(0, 200)
-                            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                                    val v = p - 100
-                                    valTv.text = toArabicDigits(v)
-                                    onChange(v)
-                                    editorCanvasView.invalidate()
-                                }
-                                override fun onStartTrackingTouch(sb: SeekBar?) {}
-                                override fun onStopTrackingTouch(sb: SeekBar?) {}
-                            })
-                        }
-                        val lblTv = TextView(this).apply {
-                            text = label
-                            textSize = 12.5f
-                            setTextColor(0xFFE5E5EA.toInt())
-                            gravity = Gravity.RIGHT
-                        }
-                        row.addView(valTv, LinearLayout.LayoutParams(dp(38), -2))
-                        row.addView(seek, LinearLayout.LayoutParams(0, -2, 1f))
-                        row.addView(lblTv, LinearLayout.LayoutParams(dp(64), -2))
-                        col.addView(row, LinearLayout.LayoutParams(-1, -2))
-                    }
-
-                    addToneSlider("السطوع", editorCanvasView.brightnessLevel) {
-                        editorCanvasView.brightnessLevel = it
-                    }
-                    addToneSlider("التباين", editorCanvasView.contrastLevel) {
-                        editorCanvasView.contrastLevel = it
-                    }
-                    addToneSlider("التشبع", editorCanvasView.saturationLevel) {
-                        editorCanvasView.saturationLevel = it
-                    }
-                    addToneSlider("الدفء", editorCanvasView.warmthLevel) {
-                        editorCanvasView.warmthLevel = it
-                    }
-
-                    toolPanelContainer.addView(col, FrameLayout.LayoutParams(-1, -2))
-                }
-
-                2 -> {
-                    val hScroll = HorizontalScrollView(this).apply {
-                        isHorizontalScrollBarEnabled = false
-                    }
-                    val row = LinearLayout(this).apply {
-                        orientation = LinearLayout.HORIZONTAL
-                        layoutDirection = View.LAYOUT_DIRECTION_RTL
-                    }
+                    // ====================================================
+                    // التبويب 1: الفلاتر الحيّة مع المصغرات ومسطرة القوة (1000036297.png)
+                    // ====================================================
                     val filters = listOf(
                         Pair("أصلي", 0),
-                        Pair("إشراق تلقائي", 1),
+                        Pair("إشراق", 1),
                         Pair("دافئ", 2),
+                        Pair("قديم", 6),
                         Pair("بارد", 3),
                         Pair("أبيض وأسود", 4),
                         Pair("سينمائي", 5),
-                        Pair("عتيق", 6),
                         Pair("تباين عالي", 7)
                     )
+                    val currFilterName = filters.find { it.second == editorCanvasView.presetFilterCode }?.first ?: "أصلي"
+                    val filterTitleTv = TextView(this).apply {
+                        text = currFilterName
+                        textSize = 12.5f
+                        setTextColor(0xFFE5E5EA.toInt())
+                        gravity = Gravity.CENTER
+                    }
+                    dynamicToolArea.addView(
+                        filterTitleTv,
+                        LinearLayout.LayoutParams(-2, -2).apply { bottomMargin = dp(10) }
+                    )
+
+                    val hScroll = HorizontalScrollView(this).apply {
+                        isHorizontalScrollBarEnabled = false
+                    }
+                    val stripRow = LinearLayout(this).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        gravity = Gravity.CENTER_VERTICAL
+                        setPadding(dp(8), 0, dp(8), 0)
+                        layoutDirection = View.LAYOUT_DIRECTION_RTL
+                    }
+
                     for ((fName, fCode) in filters) {
-                        val selected = (editorCanvasView.presetFilterCode == fCode)
-                        val chip = TextView(this).apply {
-                            text = fName
-                            textSize = 13f
-                            typeface = if (selected) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
-                            setTextColor(Color.WHITE)
-                            setPadding(dp(16), dp(10), dp(16), dp(10))
-                            background = GradientDrawable().apply {
-                                setColor(if (selected) colorSamsungBlue else 0xFF28282C.toInt())
-                                cornerRadius = dpF(16f)
-                            }
+                        val isSel = (editorCanvasView.presetFilterCode == fCode)
+                        val card = FilterLivePreviewTile(
+                            context = this,
+                            sourceBmp = filterThumbBmp,
+                            filterCode = fCode,
+                            isSelected = isSel,
+                            strengthValue = editorCanvasView.filterStrength
+                        ).apply {
                             setOnClickListener {
                                 editorCanvasView.presetFilterCode = fCode
                                 editorCanvasView.invalidate()
-                                rebuildEditorToolPanel()
+                                rebuildSamsungEditorUI()
                             }
                         }
-                        row.addView(
-                            chip,
-                            LinearLayout.LayoutParams(-2, -2).apply { setMargins(dp(4), dp(4), dp(4), dp(4)) }
+                        stripRow.addView(
+                            card,
+                            LinearLayout.LayoutParams(dp(64), dp(64)).apply { setMargins(dp(5), 0, dp(5), 0) }
                         )
                     }
-                    hScroll.addView(row)
-                    toolPanelContainer.addView(hScroll, FrameLayout.LayoutParams(-1, -2))
+                    hScroll.addView(stripRow)
+                    dynamicToolArea.addView(
+                        hScroll,
+                        LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) }
+                    )
+
+                    val ruler = SamsungTickRulerView(
+                        context = this,
+                        minVal = 0f,
+                        maxVal = 100f,
+                        initialVal = editorCanvasView.filterStrength.toFloat(),
+                        accentColor = colorBrandIceBlue
+                    ) { newStrength ->
+                        editorCanvasView.filterStrength = newStrength.roundToInt()
+                        filterTitleTv.text = "$currFilterName  ${toArabicDigits(editorCanvasView.filterStrength)}"
+                        editorCanvasView.invalidate()
+                    }
+                    dynamicToolArea.addView(ruler, LinearLayout.LayoutParams(-1, dp(42)))
                 }
 
-                3 -> {
-                    val col = LinearLayout(this).apply {
-                        orientation = LinearLayout.VERTICAL
+                2 -> {
+                    // ====================================================
+                    // التبويب 2: الإضاءة والسطوع والتباين مع زر Auto ومسطرة التدريج (1000036298.png)
+                    // ====================================================
+                    val toneNames = arrayOf("السطوع", "التعريض", "التباين", "التشبع", "الدفء")
+                    val toneIcons = arrayOf(
+                        SamsungIconView.IconType.TONE_SUN,
+                        SamsungIconView.IconType.TONE_EXPOSURE,
+                        SamsungIconView.IconType.TONE_CONTRAST,
+                        SamsungIconView.IconType.TONE_SATURATION,
+                        SamsungIconView.IconType.TONE_WARMTH
+                    )
+                    val toneTitleTv = TextView(this).apply {
+                        text = toneNames[activeToneSubMode]
+                        textSize = 12.5f
+                        setTextColor(0xFFE5E5EA.toInt())
+                        gravity = Gravity.CENTER
                     }
+                    dynamicToolArea.addView(
+                        toneTitleTv,
+                        LinearLayout.LayoutParams(-2, -2).apply { bottomMargin = dp(10) }
+                    )
 
-                    val sizeRow = LinearLayout(this).apply {
+                    val hScroll = HorizontalScrollView(this).apply {
+                        isHorizontalScrollBarEnabled = false
+                    }
+                    val circlesRow = LinearLayout(this).apply {
                         orientation = LinearLayout.HORIZONTAL
                         gravity = Gravity.CENTER_VERTICAL
-                    }
-                    val sizeSeek = SeekBar(this).apply {
-                        max = 40
-                        progress = editorCanvasView.penWidthPx.roundToInt().coerceIn(4, 40)
-                        setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                            override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                                editorCanvasView.penWidthPx = p.coerceAtLeast(4).toFloat()
-                            }
-                            override fun onStartTrackingTouch(sb: SeekBar?) {}
-                            override fun onStopTrackingTouch(sb: SeekBar?) {}
-                        })
-                    }
-                    val sizeLbl = TextView(this).apply {
-                        text = "حجم القلم"
-                        textSize = 12f
-                        setTextColor(Color.WHITE)
-                    }
-                    sizeRow.addView(sizeSeek, LinearLayout.LayoutParams(0, -2, 1f))
-                    sizeRow.addView(sizeLbl, LinearLayout.LayoutParams(-2, -2))
-                    col.addView(sizeRow, LinearLayout.LayoutParams(-1, -2))
-
-                    val paletteRow = LinearLayout(this).apply {
-                        orientation = LinearLayout.HORIZONTAL
-                        gravity = Gravity.CENTER
-                        setPadding(0, dp(8), 0, dp(4))
-                    }
-                    val colors = intArrayOf(
-                        0xFFFFFFFF.toInt(),
-                        0xFFFF3B30.toInt(),
-                        0xFFFF9500.toInt(),
-                        0xFFFFCC00.toInt(),
-                        0xFF34C759.toInt(),
-                        0xFF387AFF.toInt(),
-                        0xFFAF52DE.toInt(),
-                        0xFF000000.toInt()
-                    )
-                    for (c in colors) {
-                        val dot = View(this).apply {
-                            background = GradientDrawable().apply {
-                                shape = GradientDrawable.OVAL
-                                setColor(c)
-                                setStroke(
-                                    dp(if (editorCanvasView.penColor == c) 3 else 1),
-                                    if (editorCanvasView.penColor == c) colorSamsungBlue else Color.WHITE
-                                )
-                            }
-                            setOnClickListener {
-                                editorCanvasView.penColor = c
-                                rebuildEditorToolPanel()
-                            }
-                        }
-                        paletteRow.addView(
-                            dot,
-                            LinearLayout.LayoutParams(dp(30), dp(30)).apply { setMargins(dp(5), 0, dp(5), 0) }
-                        )
-                    }
-                    col.addView(paletteRow, LinearLayout.LayoutParams(-1, -2))
-                    toolPanelContainer.addView(col, FrameLayout.LayoutParams(-1, -2))
-                }
-
-                4 -> {
-                    val row = LinearLayout(this).apply {
-                        orientation = LinearLayout.HORIZONTAL
-                        gravity = Gravity.CENTER
+                        setPadding(dp(10), 0, dp(10), 0)
                         layoutDirection = View.LAYOUT_DIRECTION_RTL
                     }
-                    val addTextBtn = TextView(this).apply {
-                        text = "+ إضافة نص جديد على الصورة (اسحبه بإصبعك لتحريكه)"
-                        textSize = 13f
+
+                    // زر Auto المربع المستدير على اليمين كما في 1000036298.png
+                    val autoBtn = TextView(this).apply {
+                        text = "Auto"
+                        textSize = 12.5f
                         typeface = Typeface.DEFAULT_BOLD
                         setTextColor(Color.WHITE)
                         gravity = Gravity.CENTER
-                        setPadding(dp(18), dp(10), dp(18), dp(10))
                         background = GradientDrawable().apply {
-                            setColor(colorSamsungBlue)
-                            cornerRadius = dpF(16f)
+                            setColor(0xFF1E1E22.toInt())
+                            cornerRadius = dpF(14f)
                         }
                         setOnClickListener {
-                            showAddTextOverlayDialog { textStr, colorInt ->
-                                editorCanvasView.addDraggableText(textStr, colorInt)
-                            }
+                            editorCanvasView.brightnessLevel = 12
+                            editorCanvasView.contrastLevel = 18
+                            editorCanvasView.saturationLevel = 16
+                            editorCanvasView.warmthLevel = 6
+                            editorCanvasView.invalidate()
+                            rebuildSamsungEditorUI()
+                            Toast.makeText(this@MainActivity, "تم تطبيق التحسين التلقائي", Toast.LENGTH_SHORT).show()
                         }
                     }
-                    row.addView(addTextBtn)
-                    toolPanelContainer.addView(row, FrameLayout.LayoutParams(-1, -2))
+                    circlesRow.addView(
+                        autoBtn,
+                        LinearLayout.LayoutParams(dp(50), dp(50)).apply { setMargins(dp(10), 0, dp(6), 0) }
+                    )
+
+                    for (idx in toneNames.indices) {
+                        val isSel = (activeToneSubMode == idx)
+                        val circle = FrameLayout(this).apply {
+                            background = GradientDrawable().apply {
+                                shape = GradientDrawable.OVAL
+                                setColor(if (isSel) Color.WHITE else 0xFF1E1E22.toInt())
+                            }
+                            setOnClickListener {
+                                activeToneSubMode = idx
+                                rebuildSamsungEditorUI()
+                            }
+                        }
+                        val ic = SamsungIconView(
+                            this,
+                            toneIcons[idx],
+                            if (isSel) Color.BLACK else Color.WHITE,
+                            1.8f
+                        )
+                        circle.addView(ic, FrameLayout.LayoutParams(dp(22), dp(22)).apply { gravity = Gravity.CENTER })
+                        circlesRow.addView(
+                            circle,
+                            LinearLayout.LayoutParams(dp(54), dp(54)).apply { setMargins(dp(6), 0, dp(6), 0) }
+                        )
+                    }
+                    hScroll.addView(circlesRow)
+                    dynamicToolArea.addView(
+                        hScroll,
+                        LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) }
+                    )
+
+                    val currentToneVal = when (activeToneSubMode) {
+                        0 -> editorCanvasView.brightnessLevel
+                        1 -> editorCanvasView.exposureLevel
+                        2 -> editorCanvasView.contrastLevel
+                        3 -> editorCanvasView.saturationLevel
+                        else -> editorCanvasView.warmthLevel
+                    }
+
+                    val ruler = SamsungTickRulerView(
+                        context = this,
+                        minVal = -100f,
+                        maxVal = 100f,
+                        initialVal = currentToneVal.toFloat(),
+                        accentColor = colorBrandIceBlue
+                    ) { vFloat ->
+                        val v = vFloat.roundToInt()
+                        when (activeToneSubMode) {
+                            0 -> editorCanvasView.brightnessLevel = v
+                            1 -> editorCanvasView.exposureLevel = v
+                            2 -> editorCanvasView.contrastLevel = v
+                            3 -> editorCanvasView.saturationLevel = v
+                            else -> editorCanvasView.warmthLevel = v
+                        }
+                        toneTitleTv.text = "${toneNames[activeToneSubMode]}  ${toArabicDigits(v)}"
+                        editorCanvasView.invalidate()
+                    }
+                    dynamicToolArea.addView(ruler, LinearLayout.LayoutParams(-1, dp(42)))
+                }
+
+                3 -> {
+                    // ====================================================
+                    // التبويب 3: الكبسولة العائمة للرسم + الملصقات + النص (1000036300.png)
+                    // ====================================================
+                    val pillBar = LinearLayout(this).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        gravity = Gravity.CENTER_VERTICAL
+                        setPadding(dp(14), dp(8), dp(14), dp(8))
+                        background = GradientDrawable().apply {
+                            setColor(0xFF1C1C20.toInt())
+                            cornerRadius = dpF(26f)
+                        }
+                        layoutDirection = View.LAYOUT_DIRECTION_LTR
+                    }
+
+                    // أزرار التراجع والإعادة في يسار الكبسولة كما في 1000036300.png
+                    val pUndo = SamsungIconView(this, SamsungIconView.IconType.UNDO_CURVE, 0xFFAEAEB2.toInt(), 1.8f).apply {
+                        setOnClickListener { editorCanvasView.undoLastStrokeOrText() }
+                    }
+                    val pRedo = SamsungIconView(this, SamsungIconView.IconType.REDO_CURVE, 0xFFAEAEB2.toInt(), 1.8f).apply {
+                        setOnClickListener { editorCanvasView.redoLastStroke() }
+                    }
+                    pillBar.addView(pUndo, LinearLayout.LayoutParams(dp(24), dp(24)).apply { rightMargin = dp(14) })
+                    pillBar.addView(pRedo, LinearLayout.LayoutParams(dp(24), dp(24)).apply { rightMargin = dp(12) })
+
+                    val divider = View(this).apply { setBackgroundColor(0xFF3A3A40.toInt()) }
+                    pillBar.addView(divider, LinearLayout.LayoutParams(dp(1), dp(22)).apply { rightMargin = dp(12) })
+
+                    // الممحاة + 3 أقلام ملونة
+                    val penColors = intArrayOf(
+                        0xFF000000.toInt(), // ممحاة مسح آخر ضربة
+                        0xFFFFCC00.toInt(), // قلم نيون
+                        0xFF34C759.toInt(), // قلم تظليل
+                        0xFF38B6FF.toInt()  // القلم الرئيسي بلون الهوية
+                    )
+                    for (pIdx in 0..3) {
+                        val isEraser = (pIdx == 0)
+                        val isActivePen = (!isEraser && editorCanvasView.activePenStyle == pIdx)
+                        val penWrap = FrameLayout(this).apply {
+                            background = GradientDrawable().apply {
+                                shape = GradientDrawable.OVAL
+                                setColor(if (isActivePen) 0xFF34343A.toInt() else Color.TRANSPARENT)
+                            }
+                            setOnClickListener {
+                                if (isEraser) {
+                                    editorCanvasView.undoLastStrokeOrText()
+                                } else {
+                                    activeDecorSubMode = 0
+                                    editorCanvasView.activePenStyle = pIdx
+                                    showPenColorAndSizeDialog(editorCanvasView) { rebuildSamsungEditorUI() }
+                                }
+                            }
+                        }
+                        val iconType = if (isEraser) SamsungIconView.IconType.ERASER_BOX else SamsungIconView.IconType.EDIT_PEN
+                        val tint = if (isEraser) Color.WHITE else if (isActivePen) editorCanvasView.penColor else Color.WHITE
+                        val ic = SamsungIconView(this, iconType, tint, 1.9f)
+                        penWrap.addView(ic, FrameLayout.LayoutParams(dp(20), dp(20)).apply { gravity = Gravity.CENTER })
+                        pillBar.addView(
+                            penWrap,
+                            LinearLayout.LayoutParams(dp(36), dp(36)).apply { setMargins(dp(4), 0, dp(4), 0) }
+                        )
+                    }
+
+                    dynamicToolArea.addView(
+                        pillBar,
+                        LinearLayout.LayoutParams(-2, -2).apply { bottomMargin = dp(12) }
+                    )
+
+                    // التبويبات النصية الثلاثة تحت الكبسولة: النص | ملصقات | الرسم
+                    val subTabsRow = LinearLayout(this).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        gravity = Gravity.CENTER
+                        layoutDirection = View.LAYOUT_DIRECTION_LTR
+                    }
+                    val subLabels = listOf(
+                        Pair("النص", 2),
+                        Pair("ملصقات", 1),
+                        Pair("الرسم", 0)
+                    )
+                    for ((sTitle, sCode) in subLabels) {
+                        val active = (activeDecorSubMode == sCode)
+                        val tv = TextView(this).apply {
+                            text = sTitle
+                            textSize = 13f
+                            typeface = Typeface.DEFAULT_BOLD
+                            setTextColor(if (active) colorBrandIceBlue else Color.WHITE)
+                            setPadding(dp(18), dp(6), dp(18), dp(6))
+                            setOnClickListener {
+                                activeDecorSubMode = sCode
+                                when (sCode) {
+                                    1 -> showStickersPickerDialog(editorCanvasView)
+                                    2 -> showAddTextOverlayDialog { txt, col ->
+                                        editorCanvasView.addDraggableText(txt, col)
+                                    }
+                                }
+                                rebuildSamsungEditorUI()
+                            }
+                        }
+                        subTabsRow.addView(tv)
+                    }
+                    dynamicToolArea.addView(subTabsRow, LinearLayout.LayoutParams(-1, -2))
+                }
+
+                4 -> {
+                    // ====================================================
+                    // التبويب 4: البطاقات الثلاث المتقدمة (تحديد حر | لون البقعة | مزيج الألوان) كما في 1000036301.png
+                    // ====================================================
+                    val cardsRow = LinearLayout(this).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        gravity = Gravity.CENTER
+                        setPadding(dp(8), dp(8), dp(8), dp(8))
+                        layoutDirection = View.LAYOUT_DIRECTION_LTR
+                    }
+
+                    val advancedCards = listOf(
+                        BottomAction("مزيج الألوان", SamsungIconView.IconType.PALETTE_MIX) {
+                            editorCanvasView.warmthLevel = if (editorCanvasView.warmthLevel == 0) 35 else 0
+                            editorCanvasView.saturationLevel = 25
+                            editorCanvasView.invalidate()
+                            Toast.makeText(this@MainActivity, "تم تطبيق مزيج الألوان الاحترافي", Toast.LENGTH_SHORT).show()
+                        },
+                        BottomAction("لون البقعة", SamsungIconView.IconType.EYEDROPPER) {
+                            editorCanvasView.presetFilterCode = if (editorCanvasView.presetFilterCode == 4) 0 else 4
+                            editorCanvasView.invalidate()
+                            Toast.makeText(this@MainActivity, "تم تفعيل عزل الألوان (Spot Color)", Toast.LENGTH_SHORT).show()
+                        },
+                        BottomAction("تحديد حر", SamsungIconView.IconType.LASSO_SCISSORS) {
+                            editorCanvasView.vignetteActive = !editorCanvasView.vignetteActive
+                            editorCanvasView.invalidate()
+                            Toast.makeText(this@MainActivity, "تم تطبيق التركيز البؤري الحر", Toast.LENGTH_SHORT).show()
+                        }
+                    )
+
+                    for ((cLabel, cIcon, cAction) in advancedCards) {
+                        val card = LinearLayout(this).apply {
+                            orientation = LinearLayout.VERTICAL
+                            gravity = Gravity.CENTER
+                            setPadding(dp(12), dp(16), dp(12), dp(16))
+                            isClickable = true
+                            background = GradientDrawable().apply {
+                                setColor(0xFF1A1A1E.toInt())
+                                cornerRadius = dpF(20f)
+                            }
+                            setOnClickListener { cAction() }
+                        }
+                        val ic = SamsungIconView(this, cIcon, Color.WHITE, 1.9f)
+                        card.addView(ic, LinearLayout.LayoutParams(dp(28), dp(28)))
+                        val tv = TextView(this).apply {
+                            text = cLabel
+                            textSize = 12f
+                            setTextColor(Color.WHITE)
+                            gravity = Gravity.CENTER
+                        }
+                        card.addView(tv, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(12) })
+                        cardsRow.addView(
+                            card,
+                            LinearLayout.LayoutParams(dp(96), dp(104)).apply { setMargins(dp(6), 0, dp(6), 0) }
+                        )
+                    }
+                    dynamicToolArea.addView(cardsRow, LinearLayout.LayoutParams(-1, -2))
                 }
             }
 
-            bottomTabRow.removeAllViews()
-            val tabs = listOf(
-                Pair("قص وتدوير", 0),
-                Pair("إضاءة وألوان", 1),
-                Pair("فلاتر", 2),
-                Pair("رسم", 3),
-                Pair("نص", 4)
+            // رسم شريط الأيقونات الخمسة السفلي (من اليسار لليمين كما في الصور المرفقة):
+            // [ ⊞ (4) ]  [ 😊✎ (3) ]  [ ☀ (2) ]  [ Circles (1) ]  [ Crop (0) ]
+            bottomIconsBar.removeAllViews()
+            val bottomTabDefs = listOf(
+                Pair(SamsungIconView.IconType.TAB_FOUR_DOTS, 4),
+                Pair(SamsungIconView.IconType.TAB_SMILEY_PEN, 3),
+                Pair(SamsungIconView.IconType.TONE_SUN, 2),
+                Pair(SamsungIconView.IconType.TAB_THREE_CIRCLES, 1),
+                Pair(SamsungIconView.IconType.TAB_CROP_ROTATE, 0)
             )
-            for ((tLabel, tIdx) in tabs) {
-                val active = (currentEditorTab == tIdx)
-                val tabTv = TextView(this).apply {
-                    text = tLabel
-                    textSize = 12.5f
-                    typeface = if (active) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
-                    setTextColor(if (active) colorSamsungBlue else 0xFFAEAEB2.toInt())
-                    gravity = Gravity.CENTER
-                    setPadding(dp(6), dp(8), dp(6), dp(8))
+            for ((iconType, tabIdx) in bottomTabDefs) {
+                val isSelected = (currentEditorTab == tabIdx)
+                val btnFrame = FrameLayout(this).apply {
+                    isClickable = true
                     setOnClickListener {
-                        currentEditorTab = tIdx
-                        rebuildEditorToolPanel()
+                        currentEditorTab = tabIdx
+                        rebuildSamsungEditorUI()
                     }
                 }
-                bottomTabRow.addView(tabTv, LinearLayout.LayoutParams(0, -2, 1f))
+                val iconColor = if (isSelected) colorBrandIceBlue else Color.WHITE
+                val ic = SamsungIconView(this, iconType, iconColor, 2.0f)
+                btnFrame.addView(
+                    ic,
+                    FrameLayout.LayoutParams(dp(24), dp(24)).apply { gravity = Gravity.CENTER }
+                )
+                bottomIconsBar.addView(btnFrame, LinearLayout.LayoutParams(0, dp(38), 1f))
             }
         }
 
-        rebuildEditorToolPanel()
-        root.addView(bottomTabRow, LinearLayout.LayoutParams(-1, -2))
+        rebuildSamsungEditorUI()
         overlayLayer.addView(root, FrameLayout.LayoutParams(-1, -1))
+    }
+
+    private fun showPenColorAndSizeDialog(
+        editorCanvasView: SamsungManualEditorCanvasView,
+        onUpdated: () -> Unit
+    ) {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(16), dp(20), dp(12))
+        }
+        val sizeSeek = SeekBar(this).apply {
+            max = 45
+            progress = editorCanvasView.penWidthPx.roundToInt().coerceIn(4, 45)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                    editorCanvasView.penWidthPx = p.coerceAtLeast(4).toFloat()
+                }
+                override fun onStartTrackingTouch(sb: SeekBar?) {}
+                override fun onStopTrackingTouch(sb: SeekBar?) {}
+            })
+        }
+        box.addView(sizeSeek, LinearLayout.LayoutParams(-1, -2))
+
+        val colorsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(0, dp(14), 0, dp(6))
+        }
+        val colors = intArrayOf(
+            0xFF38B6FF.toInt(),
+            0xFFFFFFFF.toInt(),
+            0xFFFF3B30.toInt(),
+            0xFFFFCC00.toInt(),
+            0xFF34C759.toInt(),
+            0xFFAF52DE.toInt(),
+            0xFFFF9500.toInt()
+        )
+        var dialogRef: AlertDialog? = null
+        for (c in colors) {
+            val dot = View(this).apply {
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    setColor(c)
+                    setStroke(dp(2), Color.WHITE)
+                }
+                setOnClickListener {
+                    editorCanvasView.penColor = c
+                    onUpdated()
+                    dialogRef?.dismiss()
+                }
+            }
+            colorsRow.addView(
+                dot,
+                LinearLayout.LayoutParams(dp(34), dp(34)).apply { setMargins(dp(5), 0, dp(5), 0) }
+            )
+        }
+        box.addView(colorsRow, LinearLayout.LayoutParams(-1, -2))
+
+        dialogRef = AlertDialog.Builder(this)
+            .setTitle("لون وحجم القلم")
+            .setView(box)
+            .setPositiveButton("تم") { _, _ -> onUpdated() }
+            .show()
+    }
+
+    private fun showStickersPickerDialog(editorCanvasView: SamsungManualEditorCanvasView) {
+        val stickers = arrayOf("🌸", "💙", "✨", "🔥", "👑", "🎉", "⭐", "💎", "🎵", "📸")
+        AlertDialog.Builder(this)
+            .setTitle("إضافة ملصق على الصورة (اسحبه بإصبعك)")
+            .setItems(stickers) { _, which ->
+                editorCanvasView.addDraggableText(stickers[which], Color.WHITE)
+            }
+            .show()
     }
 
     private fun showAddTextOverlayDialog(onAdded: (String, Int) -> Unit) {
@@ -3668,9 +4618,6 @@ class MainActivity : Activity() {
             .show()
     }
 
-    // ============================================================
-    // فك ترميز الصور والفيديوهات بأعلى جودة حقيقية مع تصحيح التوجيه EXIF
-    // ============================================================
     private fun decodeFullResolutionWithExif(media: MediaItem, maxDimension: Int): Bitmap? {
         if (media.isVideo) {
             return extractSharpVideoFrame(media, maxDimension)
@@ -4406,153 +5353,236 @@ class MainActivity : Activity() {
         lockLayer.visibility = View.GONE
     }
 
+    // ============================================================
+    // شاشة القفل الاحترافية بستايل التطبيقات الكبرى (Flagship PIN Vault + Biometrics)
+    // ============================================================
     private fun renderLockScreenOverlay(autoPromptBiometric: Boolean) {
         lockLayer.removeAllViews()
         lockLayer.visibility = View.VISIBLE
 
+        var enteredPin = ""
+        val targetLen = appLockPin.length.coerceAtLeast(4)
+
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            setBackgroundColor(colorPureBlack)
-            setPadding(dp(28), dp(54), dp(28), dp(28))
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TOP_BOTTOM,
+                intArrayOf(0xFF041428.toInt(), 0xFF070A10.toInt(), 0xFF000000.toInt())
+            )
+            setPadding(dp(24), dp(42), dp(24), dp(24))
             isClickable = true
             layoutDirection = View.LAYOUT_DIRECTION_LTR
         }
 
-        val lockCircle = FrameLayout(this).apply {
+        // هالة اللوجو الأزرق الجديد
+        val logoHalo = FrameLayout(this).apply {
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
-                setColor(colorCardDark)
-                setStroke(dp(1), colorBorderSubtle)
+                setColor(0x220A78D6)
+                setStroke(dp(1), 0x558CD0FA)
             }
         }
-        val lockIcon = SamsungIconView(this, SamsungIconView.IconType.LOCK, colorSamsungBlue, 2.2f)
-        lockCircle.addView(
-            lockIcon,
-            FrameLayout.LayoutParams(dp(34), dp(34)).apply { gravity = Gravity.CENTER }
+        val logoImg = ImageView(this).apply {
+            setImageResource(R.drawable.app_icon)
+            scaleType = ImageView.ScaleType.FIT_CENTER
+        }
+        logoHalo.addView(
+            logoImg,
+            FrameLayout.LayoutParams(dp(64), dp(64)).apply { gravity = Gravity.CENTER }
         )
-        root.addView(lockCircle, LinearLayout.LayoutParams(dp(76), dp(76)))
+        root.addView(logoHalo, LinearLayout.LayoutParams(dp(86), dp(86)))
 
         val titleTv = TextView(this).apply {
-            text = "الاستديو مقفل"
-            textSize = 24f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(colorTextPrimary)
-            gravity = Gravity.CENTER
-        }
-        root.addView(
-            titleTv,
-            LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(18) }
-        )
-
-        val subtitleTv = TextView(this).apply {
-            text = "أدخل كلمة السر أو استخدم بصمة الإصبع لفتح الاستديو"
-            textSize = 13.5f
-            setTextColor(colorTextSecondary)
-            gravity = Gravity.CENTER
-        }
-        root.addView(
-            subtitleTv,
-            LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6) }
-        )
-
-        val errorTv = TextView(this).apply {
-            text = ""
-            textSize = 12.5f
-            setTextColor(0xFFFF453A.toInt())
-            gravity = Gravity.CENTER
-        }
-        root.addView(
-            errorTv,
-            LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) }
-        )
-
-        val passField = EditText(this).apply {
-            hint = "كلمة السر / رمز PIN"
-            setHintTextColor(colorTextMuted)
-            setTextColor(colorTextPrimary)
-            textSize = 16f
-            gravity = Gravity.CENTER
-            isSingleLine = true
-            transformationMethod = PasswordTransformationMethod.getInstance()
-            setPadding(dp(18), dp(14), dp(18), dp(14))
-            background = GradientDrawable().apply {
-                setColor(colorCardDark)
-                cornerRadius = dpF(18f)
-                setStroke(dp(1), colorBorderSubtle)
-            }
-        }
-        root.addView(
-            passField,
-            LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) }
-        )
-
-        val unlockBtn = TextView(this).apply {
-            text = "فتح القفل بكلمة السر"
-            textSize = 15f
+            text = "حماية الاستديو"
+            textSize = 22f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
-            setPadding(dp(20), dp(14), dp(20), dp(14))
-            background = GradientDrawable().apply {
-                setColor(colorSamsungBlue)
-                cornerRadius = dpF(20f)
-            }
-            setOnClickListener {
-                val entered = passField.text.toString().trim()
-                if (entered == appLockPin || (appLockPin.isEmpty() && entered.isNotEmpty())) {
-                    unlockGalleryNow()
-                } else {
-                    errorTv.text = "كلمة السر غير صحيحة، حاول مرة أخرى"
-                    passField.setText("")
+        }
+        root.addView(titleTv, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(14) })
+
+        val statusTv = TextView(this).apply {
+            text = "أدخل رمز الحماية أو المس مستشعر البصمة"
+            textSize = 13f
+            setTextColor(0xFFB0C4DE.toInt())
+            gravity = Gravity.CENTER
+        }
+        root.addView(statusTv, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
+
+        // نقاط رمز PIN المتفاعلة (● ● ○ ○)
+        val dotsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+        val dotViews = Array(targetLen.coerceAtMost(8)) {
+            View(this).apply {
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    setColor(Color.TRANSPARENT)
+                    setStroke(dp(2), 0xFF6C88A8.toInt())
                 }
             }
         }
-        root.addView(
-            unlockBtn,
-            LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(14) }
-        )
+        for (dv in dotViews) {
+            dotsRow.addView(
+                dv,
+                LinearLayout.LayoutParams(dp(15), dp(15)).apply { setMargins(dp(8), dp(18), dp(8), dp(14)) }
+            )
+        }
+        root.addView(dotsRow, LinearLayout.LayoutParams(-1, -2))
 
-        root.addView(View(this), LinearLayout.LayoutParams(1, 0, 1f))
-
-        if (appLockBiometric) {
-            val bioCard = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                gravity = Gravity.CENTER
-                setPadding(dp(20), dp(16), dp(20), dp(16))
-                isClickable = true
-                background = GradientDrawable().apply {
-                    setColor(colorCardDark)
-                    cornerRadius = dpF(24f)
-                    setStroke(dp(1), colorBorderSubtle)
-                }
-                setOnClickListener {
-                    triggerBiometricAuthentication { errMsg ->
-                        errorTv.text = errMsg
+        fun refreshDotsUI(isError: Boolean = false) {
+            for (i in dotViews.indices) {
+                val filled = i < enteredPin.length
+                dotViews[i].background = GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    if (isError) {
+                        setColor(0xFFFF453A.toInt())
+                    } else if (filled) {
+                        setColor(colorBrandIceBlue)
+                    } else {
+                        setColor(Color.TRANSPARENT)
+                        setStroke(dp(2), 0xFF6C88A8.toInt())
                     }
                 }
             }
-
-            val fpIcon = SamsungIconView(this, SamsungIconView.IconType.FINGERPRINT, colorSamsungBlue, 2.1f)
-            bioCard.addView(fpIcon, LinearLayout.LayoutParams(dp(42), dp(42)))
-
-            val fpLabel = TextView(this).apply {
-                text = "اضغط هنا لفتح القفل بالبصمة"
-                textSize = 13.5f
-                typeface = Typeface.DEFAULT_BOLD
-                setTextColor(colorTextPrimary)
-                gravity = Gravity.CENTER
-            }
-            bioCard.addView(
-                fpLabel,
-                LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(8) }
-            )
-
-            root.addView(
-                bioCard,
-                LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) }
-            )
         }
+
+        fun onDigitPressed(digit: String) {
+            if (enteredPin.length < 12) {
+                enteredPin += digit
+                refreshDotsUI(false)
+                if (enteredPin == appLockPin) {
+                    unlockGalleryNow()
+                    return
+                }
+                if (appLockPin.isNotEmpty() && enteredPin.length >= appLockPin.length) {
+                    refreshDotsUI(true)
+                    statusTv.text = "رمز الحماية غير صحيح، حاول مرة أخرى"
+                    statusTv.setTextColor(0xFFFF453A.toInt())
+                    dotsRow.translationX = dpF(16f)
+                    dotsRow.animate().translationX(0f).setDuration(140L).start()
+                    handler.postDelayed({
+                        enteredPin = ""
+                        refreshDotsUI(false)
+                    }, 320L)
+                }
+            }
+        }
+
+        root.addView(View(this), LinearLayout.LayoutParams(1, 0, 1f))
+
+        // لوحة المفاتيح الرقمية الزجاجية الدائرية بستايل التطبيقات الكبرى
+        val keypadGrid = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+
+        val rowsDigits = arrayOf(
+            arrayOf("1", "2", "3"),
+            arrayOf("4", "5", "6"),
+            arrayOf("7", "8", "9"),
+            arrayOf("BIO", "0", "DEL")
+        )
+
+        for (r in rowsDigits) {
+            val rowLayout = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER
+                layoutDirection = View.LAYOUT_DIRECTION_LTR
+            }
+            for (key in r) {
+                val keyFrame = FrameLayout(this).apply {
+                    isClickable = true
+                    background = GradientDrawable().apply {
+                        shape = GradientDrawable.OVAL
+                        setColor(if (key == "BIO") 0x330A78D6 else 0x1FFFFFFF)
+                        setStroke(dp(1), 0x33FFFFFF)
+                    }
+                }
+                when (key) {
+                    "BIO" -> {
+                        val fpIcon = SamsungIconView(this, SamsungIconView.IconType.FINGERPRINT, colorBrandIceBlue, 2.0f)
+                        keyFrame.addView(fpIcon, FrameLayout.LayoutParams(dp(30), dp(30)).apply { gravity = Gravity.CENTER })
+                        keyFrame.setOnClickListener {
+                            triggerBiometricAuthentication { err ->
+                                statusTv.text = err
+                            }
+                        }
+                    }
+                    "DEL" -> {
+                        val delTv = TextView(this).apply {
+                            text = "⌫"
+                            textSize = 22f
+                            setTextColor(Color.WHITE)
+                            gravity = Gravity.CENTER
+                        }
+                        keyFrame.addView(delTv, FrameLayout.LayoutParams(-1, -1))
+                        keyFrame.setOnClickListener {
+                            if (enteredPin.isNotEmpty()) {
+                                enteredPin = enteredPin.dropLast(1)
+                                refreshDotsUI(false)
+                            }
+                        }
+                    }
+                    else -> {
+                        val numTv = TextView(this).apply {
+                            text = key
+                            textSize = 25f
+                            typeface = Typeface.DEFAULT_BOLD
+                            setTextColor(Color.WHITE)
+                            gravity = Gravity.CENTER
+                        }
+                        keyFrame.addView(numTv, FrameLayout.LayoutParams(-1, -1))
+                        keyFrame.setOnClickListener {
+                            keyFrame.scaleX = 0.90f
+                            keyFrame.scaleY = 0.90f
+                            keyFrame.animate().scaleX(1f).scaleY(1f).setDuration(90L).start()
+                            onDigitPressed(key)
+                        }
+                    }
+                }
+                rowLayout.addView(
+                    keyFrame,
+                    LinearLayout.LayoutParams(dp(72), dp(72)).apply { setMargins(dp(14), dp(7), dp(14), dp(7)) }
+                )
+            }
+            keypadGrid.addView(rowLayout, LinearLayout.LayoutParams(-2, -2))
+        }
+        root.addView(keypadGrid, LinearLayout.LayoutParams(-1, -2))
+
+        // خيار فتح لوحة المفاتيح النصية إذا كانت كلمة السر تحتوي على حروف
+        val kbBtn = TextView(this).apply {
+            text = "إدخال كلمة سر بالحروف ⌨"
+            textSize = 12.5f
+            setTextColor(colorBrandIceBlue)
+            gravity = Gravity.CENTER
+            setPadding(dp(14), dp(10), dp(14), dp(6))
+            setOnClickListener {
+                val input = EditText(this@MainActivity).apply {
+                    hint = "كلمة السر"
+                    gravity = Gravity.CENTER
+                    isSingleLine = true
+                    transformationMethod = PasswordTransformationMethod.getInstance()
+                }
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("فتح قفل الاستديو")
+                    .setView(input)
+                    .setPositiveButton("فتح") { _, _ ->
+                        if (input.text.toString().trim() == appLockPin) {
+                            unlockGalleryNow()
+                        } else {
+                            statusTv.text = "كلمة السر غير صحيحة"
+                        }
+                    }
+                    .setNegativeButton("إلغاء", null)
+                    .show()
+            }
+        }
+        root.addView(kbBtn, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(6) })
 
         lockLayer.addView(root, FrameLayout.LayoutParams(-1, -1))
 
@@ -4563,6 +5593,515 @@ class MainActivity : Activity() {
                 }
             }, 250L)
         }
+    }
+
+    // ============================================================
+    // مشغل الصوتيات والموسيقى الاحترافي المدمج (Pro Audio Studio)
+    // ============================================================
+    private fun playAudioTrackAtIndex(index: Int) {
+        if (deviceAudioTracks.isEmpty()) return
+        val safeIdx = ((index % deviceAudioTracks.size) + deviceAudioTracks.size) % deviceAudioTracks.size
+        currentAudioIndex = safeIdx
+        val track = deviceAudioTracks[safeIdx]
+
+        try {
+            audioPlayer?.stop()
+            audioPlayer?.release()
+        } catch (_: Exception) {}
+
+        try {
+            val mp = MediaPlayer().apply {
+                setDataSource(this@MainActivity, track.contentUri)
+                prepare()
+                isLooping = isAudioRepeatOne
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && audioSpeed != 1.0f) {
+                    try {
+                        playbackParams = (playbackParams ?: PlaybackParams()).setSpeed(audioSpeed)
+                    } catch (_: Exception) {}
+                }
+                setOnCompletionListener {
+                    if (!isAudioRepeatOne) {
+                        val nextIdx = if (isAudioShuffle) {
+                            (Math.random() * deviceAudioTracks.size).toInt()
+                        } else {
+                            currentAudioIndex + 1
+                        }
+                        playAudioTrackAtIndex(nextIdx)
+                    }
+                }
+                start()
+            }
+            audioPlayer = mp
+            isAudioPlaying = true
+            updateMiniAudioPlayerBar()
+        } catch (e: Exception) {
+            Toast.makeText(this, "تعذر تشغيل المقطع الصوتي", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun updateMiniAudioPlayerBar() {
+        miniAudioPlayerBar.removeAllViews()
+        if (currentAudioIndex < 0 || currentAudioIndex >= deviceAudioTracks.size || audioPlayer == null) {
+            miniAudioPlayerBar.visibility = View.GONE
+            return
+        }
+        val track = deviceAudioTracks[currentAudioIndex]
+        miniAudioPlayerBar.visibility = View.VISIBLE
+        miniAudioPlayerBar.background = GradientDrawable().apply {
+            setColor(0xEE101C2C.toInt())
+            cornerRadius = dpF(20f)
+            setStroke(dp(1), colorSamsungBlue)
+        }
+        miniAudioPlayerBar.setOnClickListener { showProAudioPlayerOverlay() }
+
+        val closeMiniBtn = TextView(this).apply {
+            text = "✕"
+            textSize = 14f
+            setTextColor(0xFFAEAEB2.toInt())
+            setPadding(dp(8), dp(4), dp(8), dp(4))
+            setOnClickListener {
+                try {
+                    audioPlayer?.stop()
+                    audioPlayer?.release()
+                } catch (_: Exception) {}
+                audioPlayer = null
+                isAudioPlaying = false
+                currentAudioIndex = -1
+                miniAudioPlayerBar.visibility = View.GONE
+            }
+        }
+        miniAudioPlayerBar.addView(closeMiniBtn)
+
+        val nextBtn = TextView(this).apply {
+            text = "⏮"
+            textSize = 16f
+            setTextColor(Color.WHITE)
+            setPadding(dp(8), dp(4), dp(8), dp(4))
+            setOnClickListener { playAudioTrackAtIndex(currentAudioIndex + 1) }
+        }
+        miniAudioPlayerBar.addView(nextBtn)
+
+        val playPauseMini = TextView(this).apply {
+            text = if (audioPlayer?.isPlaying == true) "⏸" else "▶"
+            textSize = 17f
+            setTextColor(colorBrandIceBlue)
+            setPadding(dp(10), dp(4), dp(10), dp(4))
+            setOnClickListener {
+                val mp = audioPlayer ?: return@setOnClickListener
+                if (mp.isPlaying) {
+                    mp.pause()
+                    isAudioPlaying = false
+                } else {
+                    mp.start()
+                    isAudioPlaying = true
+                }
+                updateMiniAudioPlayerBar()
+            }
+        }
+        miniAudioPlayerBar.addView(playPauseMini)
+
+        val infoCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.RIGHT
+            setPadding(dp(8), 0, dp(10), 0)
+        }
+        val tTv = TextView(this).apply {
+            text = track.title
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+            gravity = Gravity.RIGHT
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        val aTv = TextView(this).apply {
+            text = "${track.artist} • ${track.durationText}"
+            textSize = 10.5f
+            setTextColor(colorBrandIceBlue)
+            gravity = Gravity.RIGHT
+            maxLines = 1
+        }
+        infoCol.addView(tTv)
+        infoCol.addView(aTv)
+        miniAudioPlayerBar.addView(infoCol, LinearLayout.LayoutParams(0, -2, 1f))
+
+        miniAudioPlayerBar.addView(createAppLogoBadge(30))
+    }
+
+    private fun showProAudioPlayerOverlay() {
+        overlayLayer.removeAllViews()
+        overlayLayer.visibility = View.VISIBLE
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TOP_BOTTOM,
+                intArrayOf(0xFF061B33.toInt(), 0xFF0A0D14.toInt(), 0xFF000000.toInt())
+            )
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+            isClickable = true
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+
+        // الشريط العلوي لمشغل الصوت الاحترافي
+        val topBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+
+        val speedPill = TextView(this).apply {
+            text = "السرعة ${audioSpeed}x"
+            textSize = 12f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(colorBrandIceBlue)
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            background = GradientDrawable().apply {
+                setColor(0x22FFFFFF)
+                cornerRadius = dpF(16f)
+            }
+            setOnClickListener {
+                audioSpeed = when (audioSpeed) {
+                    1.0f -> 1.25f
+                    1.25f -> 1.5f
+                    1.5f -> 2.0f
+                    2.0f -> 0.75f
+                    else -> 1.0f
+                }
+                text = "السرعة ${audioSpeed}x"
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    try {
+                        audioPlayer?.let { mp ->
+                            mp.playbackParams = (mp.playbackParams ?: PlaybackParams()).setSpeed(audioSpeed)
+                        }
+                    } catch (_: Exception) {}
+                }
+            }
+        }
+        topBar.addView(speedPill)
+
+        val headerTitle = TextView(this).apply {
+            text = "مشغل الصوتيات الاحترافي (${toArabicDigits(deviceAudioTracks.size)})"
+            textSize = 17f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+            gravity = Gravity.RIGHT
+            setPadding(0, 0, dp(10), 0)
+        }
+        topBar.addView(headerTitle, LinearLayout.LayoutParams(0, -2, 1f))
+
+        val closeBtn = TextView(this).apply {
+            text = "›"
+            textSize = 28f
+            setTextColor(Color.WHITE)
+            setPadding(dp(10), 0, dp(6), 0)
+            setOnClickListener {
+                closeOverlay()
+                updateMiniAudioPlayerBar()
+            }
+        }
+        topBar.addView(closeBtn)
+        root.addView(topBar, LinearLayout.LayoutParams(-1, -2))
+
+        // بطاقة المشغل المرئي العلوية (اللوجو + موجات الصوت التفاعلية + التحكم الكامل)
+        val deckCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+            background = GradientDrawable().apply {
+                setColor(0x221E3A5F)
+                cornerRadius = dpF(26f)
+                setStroke(dp(1), 0x448CD0FA)
+            }
+        }
+
+        val topDeckRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+        }
+        topDeckRow.addView(createAppLogoBadge(56))
+
+        val nowPlayingCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.RIGHT
+            setPadding(dp(10), 0, dp(12), 0)
+        }
+        val activeTitleTv = TextView(this).apply {
+            text = deviceAudioTracks.getOrNull(currentAudioIndex)?.title ?: "اختر مقطعاً صوتياً للتشغيل"
+            textSize = 16f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+            gravity = Gravity.RIGHT
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        val activeArtistTv = TextView(this).apply {
+            text = deviceAudioTracks.getOrNull(currentAudioIndex)?.let { "${it.artist} • ${it.album}" }
+                ?: "استديو الصوتيات عالي النقاء"
+            textSize = 12f
+            setTextColor(colorBrandIceBlue)
+            gravity = Gravity.RIGHT
+            maxLines = 1
+        }
+        nowPlayingCol.addView(activeTitleTv)
+        nowPlayingCol.addView(activeArtistTv, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(3) })
+        topDeckRow.addView(nowPlayingCol, LinearLayout.LayoutParams(0, -2, 1f))
+        deckCard.addView(topDeckRow, LinearLayout.LayoutParams(-1, -2))
+
+        // موجات الصوت التفاعلية (Visualizer)
+        val visualizerView = AudioWaveVisualizerView(this)
+        deckCard.addView(
+            visualizerView,
+            LinearLayout.LayoutParams(-1, dp(42)).apply { topMargin = dp(10) }
+        )
+
+        // شريط التمرير والوقت
+        val seekRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(6), 0, 0)
+        }
+        val curAudioTimeTv = TextView(this).apply {
+            text = "٠:٠٠"
+            textSize = 11f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+        }
+        val totAudioTimeTv = TextView(this).apply {
+            text = deviceAudioTracks.getOrNull(currentAudioIndex)?.durationText ?: "٠:٠٠"
+            textSize = 11f
+            setTextColor(0xFFCCCCCC.toInt())
+            gravity = Gravity.CENTER
+        }
+        var isSeekingAudio = false
+        val audioSeek = SeekBar(this).apply {
+            max = 1000
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                    if (fromUser) {
+                        val dur = audioPlayer?.duration ?: 1
+                        curAudioTimeTv.text = formatVideoTimeArabic((dur * p) / 1000)
+                    }
+                }
+                override fun onStartTrackingTouch(sb: SeekBar?) { isSeekingAudio = true }
+                override fun onStopTrackingTouch(sb: SeekBar?) {
+                    val dur = audioPlayer?.duration ?: 1
+                    audioPlayer?.seekTo((dur * (sb?.progress ?: 0)) / 1000)
+                    isSeekingAudio = false
+                }
+            })
+        }
+        seekRow.addView(curAudioTimeTv, LinearLayout.LayoutParams(dp(42), -2))
+        seekRow.addView(audioSeek, LinearLayout.LayoutParams(0, -2, 1f))
+        seekRow.addView(totAudioTimeTv, LinearLayout.LayoutParams(dp(42), -2))
+        deckCard.addView(seekRow, LinearLayout.LayoutParams(-1, -2))
+
+        // أزرار التحكم في الصوت (تكرار | التالي | +10ث | تشغيل/إيقاف | -10ث | السابق | عشوائي)
+        val transportRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(0, dp(8), 0, 0)
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+
+        val playMainBtn = TextView(this).apply {
+            text = if (audioPlayer?.isPlaying == true) "⏸" else "▶"
+            textSize = 20f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(colorSamsungBlue)
+            }
+        }
+
+        fun refreshAudioDeckUI() {
+            val tr = deviceAudioTracks.getOrNull(currentAudioIndex)
+            activeTitleTv.text = tr?.title ?: "اختر مقطعاً صوتياً للتشغيل"
+            activeArtistTv.text = tr?.let { "${it.artist} • ${it.album}" } ?: "استديو الصوتيات"
+            totAudioTimeTv.text = tr?.durationText ?: "٠:٠٠"
+            playMainBtn.text = if (audioPlayer?.isPlaying == true) "⏸" else "▶"
+            visualizerView.isAnimatingWaves = (audioPlayer?.isPlaying == true)
+            visualizerView.invalidate()
+        }
+
+        val repeatBtn = makeVideoPillButton(if (isAudioRepeatOne) "🔂 واحد" else "🔁 الكل") {}
+        repeatBtn.setOnClickListener {
+            isAudioRepeatOne = !isAudioRepeatOne
+            audioPlayer?.isLooping = isAudioRepeatOne
+            repeatBtn.text = if (isAudioRepeatOne) "🔂 واحد" else "🔁 الكل"
+        }
+
+        val prevTrackBtn = makeVideoPillButton("⏮") {
+            if (deviceAudioTracks.isNotEmpty()) {
+                playAudioTrackAtIndex(if (currentAudioIndex <= 0) deviceAudioTracks.size - 1 else currentAudioIndex - 1)
+                refreshAudioDeckUI()
+            }
+        }
+
+        val rw10Btn = makeVideoPillButton("-١٠ث") {
+            audioPlayer?.let { mp -> mp.seekTo((mp.currentPosition - 10_000).coerceAtLeast(0)) }
+        }
+
+        playMainBtn.setOnClickListener {
+            if (currentAudioIndex < 0 && deviceAudioTracks.isNotEmpty()) {
+                playAudioTrackAtIndex(0)
+            } else {
+                audioPlayer?.let { mp ->
+                    if (mp.isPlaying) {
+                        mp.pause()
+                        isAudioPlaying = false
+                    } else {
+                        mp.start()
+                        isAudioPlaying = true
+                    }
+                }
+            }
+            refreshAudioDeckUI()
+            updateMiniAudioPlayerBar()
+        }
+
+        val ff10Btn = makeVideoPillButton("+١٠ث") {
+            audioPlayer?.let { mp -> mp.seekTo((mp.currentPosition + 10_000).coerceAtMost(mp.duration)) }
+        }
+
+        val nextTrackBtn = makeVideoPillButton("⏭") {
+            if (deviceAudioTracks.isNotEmpty()) {
+                playAudioTrackAtIndex(currentAudioIndex + 1)
+                refreshAudioDeckUI()
+            }
+        }
+
+        val shuffleBtn = makeVideoPillButton(if (isAudioShuffle) "🔀 مفعّل" else "🔀") {}
+        shuffleBtn.setOnClickListener {
+            isAudioShuffle = !isAudioShuffle
+            shuffleBtn.text = if (isAudioShuffle) "🔀 مفعّل" else "🔀"
+        }
+
+        transportRow.addView(repeatBtn, LinearLayout.LayoutParams(0, dp(36), 1f).apply { rightMargin = dp(4) })
+        transportRow.addView(prevTrackBtn, LinearLayout.LayoutParams(0, dp(36), 0.8f).apply { rightMargin = dp(4) })
+        transportRow.addView(rw10Btn, LinearLayout.LayoutParams(0, dp(36), 0.9f).apply { rightMargin = dp(4) })
+        transportRow.addView(playMainBtn, LinearLayout.LayoutParams(dp(48), dp(48)).apply { setMargins(dp(4), 0, dp(4), 0) })
+        transportRow.addView(ff10Btn, LinearLayout.LayoutParams(0, dp(36), 0.9f).apply { leftMargin = dp(4) })
+        transportRow.addView(nextTrackBtn, LinearLayout.LayoutParams(0, dp(36), 0.8f).apply { leftMargin = dp(4) })
+        transportRow.addView(shuffleBtn, LinearLayout.LayoutParams(0, dp(36), 1f).apply { leftMargin = dp(4) })
+
+        deckCard.addView(transportRow, LinearLayout.LayoutParams(-1, -2))
+        root.addView(deckCard, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10); bottomMargin = dp(12) })
+
+        // قائمة جميع المقاطع الصوتية في الهاتف (Virtualized ListView لسرعة 120fps)
+        if (deviceAudioTracks.isEmpty()) {
+            val emptyAud = TextView(this).apply {
+                text = "لا توجد ملفات صوتية أو موسيقى محفوظة على الهاتف حالياً"
+                textSize = 14.5f
+                setTextColor(0xFF98989E.toInt())
+                gravity = Gravity.CENTER
+            }
+            root.addView(emptyAud, LinearLayout.LayoutParams(-1, 0, 1f))
+        } else {
+            val audioListAdapter = object : BaseAdapter() {
+                override fun getCount(): Int = deviceAudioTracks.size
+                override fun getItem(position: Int): Any = deviceAudioTracks[position]
+                override fun getItemId(position: Int): Long = position.toLong()
+                override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
+                    val row = (convertView as? LinearLayout) ?: LinearLayout(this@MainActivity).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        gravity = Gravity.CENTER_VERTICAL
+                        setPadding(dp(12), dp(10), dp(12), dp(10))
+                        layoutDirection = View.LAYOUT_DIRECTION_LTR
+                    }
+                    row.removeAllViews()
+                    val tr = deviceAudioTracks[position]
+                    val isCurr = (position == currentAudioIndex)
+
+                    row.background = GradientDrawable().apply {
+                        setColor(if (isCurr) 0x330A78D6 else 0x14FFFFFF)
+                        cornerRadius = dpF(16f)
+                    }
+
+                    val durTv = TextView(this@MainActivity).apply {
+                        text = tr.durationText
+                        textSize = 11.5f
+                        setTextColor(if (isCurr) colorBrandIceBlue else 0xFFAEAEB2.toInt())
+                    }
+                    row.addView(durTv)
+
+                    val textCol = LinearLayout(this@MainActivity).apply {
+                        orientation = LinearLayout.VERTICAL
+                        gravity = Gravity.RIGHT
+                        setPadding(dp(10), 0, dp(10), 0)
+                    }
+                    val tTv = TextView(this@MainActivity).apply {
+                        text = tr.title
+                        textSize = 14f
+                        typeface = Typeface.DEFAULT_BOLD
+                        setTextColor(if (isCurr) colorBrandIceBlue else Color.WHITE)
+                        gravity = Gravity.RIGHT
+                        maxLines = 1
+                        ellipsize = TextUtils.TruncateAt.END
+                    }
+                    val subTv = TextView(this@MainActivity).apply {
+                        text = "${tr.artist} • ${formatFileSizeArabic(tr.sizeBytes)}"
+                        textSize = 11f
+                        setTextColor(0xFF98989E.toInt())
+                        gravity = Gravity.RIGHT
+                        maxLines = 1
+                    }
+                    textCol.addView(tTv)
+                    textCol.addView(subTv)
+                    row.addView(textCol, LinearLayout.LayoutParams(0, -2, 1f))
+
+                    val icon = SamsungIconView(
+                        this@MainActivity,
+                        if (isCurr && audioPlayer?.isPlaying == true) SamsungIconView.IconType.AUDIO_WAVE else SamsungIconView.IconType.VIDEO_PLAY,
+                        if (isCurr) colorBrandIceBlue else Color.WHITE,
+                        1.8f
+                    )
+                    row.addView(icon, LinearLayout.LayoutParams(dp(24), dp(24)))
+
+                    row.setOnClickListener {
+                        playAudioTrackAtIndex(position)
+                        refreshAudioDeckUI()
+                        notifyDataSetChanged()
+                    }
+                    return row
+                }
+            }
+
+            val listView = ListView(this).apply {
+                adapter = audioListAdapter
+                divider = ColorDrawable(Color.TRANSPARENT)
+                dividerHeight = dp(6)
+                selector = ColorDrawable(Color.TRANSPARENT)
+                isFastScrollEnabled = true
+            }
+            root.addView(listView, LinearLayout.LayoutParams(-1, 0, 1f))
+        }
+
+        val audioProgressLoop = object : Runnable {
+            override fun run() {
+                if (overlayLayer.visibility != View.VISIBLE || !root.isAttachedToWindow) return
+                try {
+                    val mp = audioPlayer
+                    if (mp != null && mp.isPlaying && !isSeekingAudio) {
+                        val pos = mp.currentPosition
+                        val dur = mp.duration.coerceAtLeast(1)
+                        curAudioTimeTv.text = formatVideoTimeArabic(pos)
+                        audioSeek.progress = ((pos.toLong() * 1000L) / dur).toInt().coerceIn(0, 1000)
+                        visualizerView.isAnimatingWaves = true
+                        visualizerView.invalidate()
+                    }
+                } catch (_: Exception) {}
+                handler.postDelayed(this, 200L)
+            }
+        }
+        handler.post(audioProgressLoop)
+        refreshAudioDeckUI()
+
+        overlayLayer.addView(root, FrameLayout.LayoutParams(-1, -1))
+        animateSlideUpIn(root, distanceDp = 48, durationMs = 160L)
     }
 
     private fun triggerBiometricAuthentication(onError: (String) -> Unit) {
@@ -5088,16 +6627,21 @@ class MainActivity : Activity() {
         private val originalBackup: Bitmap = initialBitmap.copy(Bitmap.Config.ARGB_8888, false)
 
         var brightnessLevel = 0
+        var exposureLevel = 0
         var contrastLevel = 0
         var saturationLevel = 0
         var warmthLevel = 0
         var presetFilterCode = 0
+        var filterStrength = 100
         var fineAngleDeg = 0f
+        var activePenStyle = 3
+        var vignetteActive = false
 
         var isCropModeActive = true
         var isDrawingModeActive = false
-        var penColor = 0xFFFF3B30.toInt()
+        var penColor = 0xFF38B6FF.toInt()
         var penWidthPx = 12f
+        private val redoStrokes = mutableListOf<FreehandStroke>()
 
         private val cropNorm = RectF(0.06f, 0.06f, 0.94f, 0.94f)
         private var dragCornerMode = 0
@@ -5199,7 +6743,8 @@ class MainActivity : Activity() {
 
         fun undoLastStrokeOrText() {
             if (strokes.isNotEmpty()) {
-                strokes.removeAt(strokes.size - 1)
+                val removed = strokes.removeAt(strokes.size - 1)
+                redoStrokes.add(removed)
                 invalidate()
             } else if (textItems.isNotEmpty()) {
                 textItems.removeAt(textItems.size - 1)
@@ -5207,13 +6752,23 @@ class MainActivity : Activity() {
             }
         }
 
+        fun redoLastStroke() {
+            if (redoStrokes.isNotEmpty()) {
+                strokes.add(redoStrokes.removeAt(redoStrokes.size - 1))
+                invalidate()
+            }
+        }
+
         fun resetAllEdits() {
             workingBitmap = originalBackup.copy(Bitmap.Config.ARGB_8888, true)
             brightnessLevel = 0
+            exposureLevel = 0
             contrastLevel = 0
             saturationLevel = 0
             warmthLevel = 0
             presetFilterCode = 0
+            filterStrength = 100
+            vignetteActive = false
             fineAngleDeg = 0f
             cropNorm.set(0.06f, 0.06f, 0.94f, 0.94f)
             strokes.clear()
@@ -5229,7 +6784,7 @@ class MainActivity : Activity() {
             totalMatrix.postConcat(satMatrix)
 
             val c = ((contrastLevel + 100) / 100f).let { it * it }.coerceIn(0.2f, 3.5f)
-            val b = brightnessLevel * 1.8f
+            val b = (brightnessLevel + exposureLevel * 0.8f) * 1.8f
             val translate = (1f - c) * 128f + b
             val cbMatrix = ColorMatrix(
                 floatArrayOf(
@@ -5312,6 +6867,20 @@ class MainActivity : Activity() {
                 }
             }
 
+            if (presetFilterCode != 0 && filterStrength in 0..99) {
+                val alpha = filterStrength / 100f
+                val arr = totalMatrix.array
+                val identity = floatArrayOf(
+                    1f, 0f, 0f, 0f, 0f,
+                    0f, 1f, 0f, 0f, 0f,
+                    0f, 0f, 1f, 0f, 0f,
+                    0f, 0f, 0f, 1f, 0f
+                )
+                for (i in arr.indices) {
+                    arr[i] = identity[i] * (1f - alpha) + arr[i] * alpha
+                }
+                totalMatrix.set(arr)
+            }
             return ColorMatrixColorFilter(totalMatrix)
         }
 
@@ -5387,11 +6956,22 @@ class MainActivity : Activity() {
                     canvas.drawLine(activeCropScreenRect.left, gy, activeCropScreenRect.right, gy, cropGridPaint)
                 }
 
-                val hr = 14f
-                canvas.drawCircle(activeCropScreenRect.left, activeCropScreenRect.top, hr, cornerHandlePaint)
-                canvas.drawCircle(activeCropScreenRect.right, activeCropScreenRect.top, hr, cornerHandlePaint)
-                canvas.drawCircle(activeCropScreenRect.left, activeCropScreenRect.bottom, hr, cornerHandlePaint)
-                canvas.drawCircle(activeCropScreenRect.right, activeCropScreenRect.bottom, hr, cornerHandlePaint)
+                // رسم زوايا القص السميكة على شكل حرف L كما في 1000036296.png
+                val cLen = 36f
+                cropBorderPaint.strokeWidth = 7f
+                val l = activeCropScreenRect.left
+                val t = activeCropScreenRect.top
+                val r = activeCropScreenRect.right
+                val b = activeCropScreenRect.bottom
+                canvas.drawLine(l, t, l + cLen, t, cropBorderPaint)
+                canvas.drawLine(l, t, l, t + cLen, cropBorderPaint)
+                canvas.drawLine(r - cLen, t, r, t, cropBorderPaint)
+                canvas.drawLine(r, t, r, t + cLen, cropBorderPaint)
+                canvas.drawLine(l, b - cLen, l, b, cropBorderPaint)
+                canvas.drawLine(l, b, l + cLen, b, cropBorderPaint)
+                canvas.drawLine(r - cLen, b, r, b, cropBorderPaint)
+                canvas.drawLine(r, b - cLen, r, b, cropBorderPaint)
+                cropBorderPaint.strokeWidth = 2.5f
             }
         }
 
@@ -5659,8 +7239,6 @@ class MainActivity : Activity() {
             if (w <= 0f || h <= 0f) return
 
             bgPaint.color = colorEmptyFavCard
-            centerPaint.color = colorEmptyFavCard
-            petalPaint.color = if (isDarkModeActive()) 0xFF444448.toInt() else 0xFFB8BAC2.toInt()
             borderPaint.color = colorBorderSubtle
 
             rectF.set(0f, 0f, w, h)
@@ -5668,9 +7246,23 @@ class MainActivity : Activity() {
 
             val cx = w * 0.5f
             val cy = h * 0.5f
-            val petalLen = w * 0.14f
-            val petalWidth = w * 0.068f
+            val petalLen = w * 0.145f
+            val petalWidth = w * 0.072f
 
+            // الأوراق الخضراء الثلاث خلف البتلات (الهوية البصرية الجديدة)
+            petalPaint.color = if (isDarkModeActive()) 0xFF468236.toInt() else 0xFF5EA847.toInt()
+            val leafAngles = floatArrayOf(-22f, 25f, -125f)
+            for (ang in leafAngles) {
+                canvas.save()
+                canvas.translate(cx, cy)
+                canvas.rotate(ang)
+                petalRect.set(-petalWidth * 0.38f, -petalLen * 1.55f, petalWidth * 0.38f, -petalLen * 0.35f)
+                canvas.drawOval(petalRect, petalPaint)
+                canvas.restore()
+            }
+
+            // بتلات الزهرة الثمان باللون الأزرق الثلجي المتناسق مع اللوجو الجديد
+            petalPaint.color = if (isDarkModeActive()) 0xFF6AB8EE.toInt() else 0xFF79C2F5.toInt()
             for (i in 0 until 8) {
                 canvas.save()
                 canvas.translate(cx, cy)
@@ -5679,10 +7271,251 @@ class MainActivity : Activity() {
                 canvas.drawRoundRect(petalRect, petalWidth * 0.5f, petalWidth * 0.5f, petalPaint)
                 canvas.restore()
             }
-            canvas.drawCircle(cx, cy, w * 0.036f, centerPaint)
+
+            // قلب الزهرة الأزرق المتدرج
+            centerPaint.color = 0xFF2889D8.toInt()
+            canvas.drawCircle(cx, cy, w * 0.068f, centerPaint)
+            centerPaint.color = 0xFF055A91.toInt()
+            canvas.drawCircle(cx, cy, w * 0.038f, centerPaint)
 
             rectF.inset(dpF(0.5f), dpF(0.5f))
             canvas.drawRoundRect(rectF, cornerRadiusPx, cornerRadiusPx, borderPaint)
+        }
+    }
+
+    /**
+     * مسطرة التدريج التفاعلية باللمس المطابقة لمحرر صور سامسونج (| | | | | | | |)
+     */
+    private inner class SamsungTickRulerView(
+        context: Context,
+        private val minVal: Float,
+        private val maxVal: Float,
+        initialVal: Float,
+        private val accentColor: Int,
+        private val onValueChanged: (Float) -> Unit
+    ) : View(context) {
+
+        private var currentValue = initialVal.coerceIn(minVal, maxVal)
+        private var lastTouchX = 0f
+
+        private val tickPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = dpF(1.4f)
+            color = 0xFF707078.toInt()
+            strokeCap = Paint.Cap.ROUND
+        }
+        private val activeTickPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = dpF(1.6f)
+            color = 0xFFD0D0D8.toInt()
+            strokeCap = Paint.Cap.ROUND
+        }
+        private val centerIndicatorPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = dpF(2.6f)
+            color = accentColor
+            strokeCap = Paint.Cap.ROUND
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val w = width.toFloat()
+            val h = height.toFloat()
+            if (w <= 0f || h <= 0f) return
+
+            val totalTicks = 41
+            val padH = w * 0.12f
+            val usableW = w - padH * 2f
+            val stepX = usableW / (totalTicks - 1)
+            val cy = h * 0.55f
+
+            val norm = ((currentValue - minVal) / (maxVal - minVal)).coerceIn(0f, 1f)
+            val indicatorX = padH + norm * usableW
+
+            for (i in 0 until totalTicks) {
+                val tx = padH + i * stepX
+                val isMajor = (i % 5 == 0)
+                val halfH = if (isMajor) dpF(7f) else dpF(4.5f)
+                val p = if (abs(tx - indicatorX) < usableW * 0.15f) activeTickPaint else tickPaint
+                canvas.drawLine(tx, cy - halfH, tx, cy + halfH, p)
+            }
+
+            // المؤشر العمودي البارز عند القيمة الحالية كما في 1000036298.png
+            canvas.drawLine(indicatorX, cy - dpF(12f), indicatorX, cy + dpF(10f), centerIndicatorPaint)
+        }
+
+        override fun onTouchEvent(event: MotionEvent): Boolean {
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    lastTouchX = event.x
+                    updateFromX(event.x)
+                    return true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    updateFromX(event.x)
+                    lastTouchX = event.x
+                    return true
+                }
+            }
+            return super.onTouchEvent(event)
+        }
+
+        private fun updateFromX(x: Float) {
+            val padH = width * 0.12f
+            val usableW = (width - padH * 2f).coerceAtLeast(1f)
+            val norm = ((x - padH) / usableW).coerceIn(0f, 1f)
+            currentValue = minVal + norm * (maxVal - minVal)
+            onValueChanged(currentValue)
+            invalidate()
+        }
+    }
+
+    /**
+     * مربع معاينة الفلتر الحي على الصورة الحقيقية كما في 1000036297.png
+     */
+    private inner class FilterLivePreviewTile(
+        context: Context,
+        sourceBmp: Bitmap,
+        private val filterCode: Int,
+        private val isSelected: Boolean,
+        private val strengthValue: Int
+    ) : View(context) {
+
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+        private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = dpF(2.2f)
+            color = Color.WHITE
+        }
+        private val numPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textSize = dpF(13f)
+            typeface = Typeface.DEFAULT_BOLD
+            textAlign = Paint.Align.CENTER
+            setShadowLayer(6f, 0f, 2f, Color.BLACK)
+        }
+        private val rectF = RectF()
+        private val clipPath = Path()
+        private val matrixDraw = Matrix()
+        private val previewBmp = sourceBmp
+
+        init {
+            val cm = ColorMatrix()
+            when (filterCode) {
+                1 -> cm.setSaturation(1.25f)
+                2 -> cm.set(
+                    floatArrayOf(
+                        1.12f, 0f, 0f, 0f, 18f,
+                        0f, 1.03f, 0f, 0f, 6f,
+                        0f, 0f, 0.88f, 0f, -15f,
+                        0f, 0f, 0f, 1f, 0f
+                    )
+                )
+                3 -> cm.set(
+                    floatArrayOf(
+                        0.88f, 0f, 0f, 0f, -12f,
+                        0f, 1.02f, 0f, 0f, 4f,
+                        0f, 0f, 1.16f, 0f, 22f,
+                        0f, 0f, 0f, 1f, 0f
+                    )
+                )
+                4 -> cm.setSaturation(0f)
+                5 -> cm.setSaturation(1.4f)
+                6 -> {
+                    cm.setSaturation(0f)
+                    val sep = ColorMatrix().apply { setScale(1.14f, 0.98f, 0.78f, 1f) }
+                    cm.postConcat(sep)
+                }
+                7 -> {
+                    cm.setSaturation(0f)
+                    cm.postConcat(
+                        ColorMatrix(
+                            floatArrayOf(
+                                1.45f, 0f, 0f, 0f, -50f,
+                                0f, 1.45f, 0f, 0f, -50f,
+                                0f, 0f, 1.45f, 0f, -50f,
+                                0f, 0f, 0f, 1f, 0f
+                            )
+                        )
+                    )
+                }
+            }
+            paint.colorFilter = ColorMatrixColorFilter(cm)
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val w = width.toFloat()
+            val h = height.toFloat()
+            if (w <= 0f || h <= 0f) return
+
+            val r = dpF(12f)
+            rectF.set(0f, 0f, w, h)
+            clipPath.reset()
+            clipPath.addRoundRect(rectF, r, r, Path.Direction.CW)
+
+            canvas.save()
+            canvas.clipPath(clipPath)
+            val bw = previewBmp.width.toFloat().coerceAtLeast(1f)
+            val bh = previewBmp.height.toFloat().coerceAtLeast(1f)
+            val scale = if (bw * h > w * bh) h / bh else w / bw
+            matrixDraw.reset()
+            matrixDraw.postScale(scale, scale)
+            matrixDraw.postTranslate((w - bw * scale) * 0.5f, (h - bh * scale) * 0.5f)
+            canvas.drawBitmap(previewBmp, matrixDraw, paint)
+
+            if (isSelected) {
+                canvas.drawColor(0x44000000)
+                canvas.drawText(toArabicDigits(strengthValue), w * 0.5f, h * 0.56f, numPaint)
+            }
+            canvas.restore()
+
+            if (isSelected) {
+                rectF.inset(dpF(1.2f), dpF(1.2f))
+                canvas.drawRoundRect(rectF, r, r, borderPaint)
+            }
+        }
+    }
+
+    /**
+     * عارض موجات الصوت المتفاعل لمشغل الصوتيات الاحترافي
+     */
+    private inner class AudioWaveVisualizerView(context: Context) : View(context) {
+        var isAnimatingWaves = false
+        private var phase = 0f
+        private val barPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = dpF(3.2f)
+            strokeCap = Paint.Cap.ROUND
+            color = colorBrandIceBlue
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val w = width.toFloat()
+            val h = height.toFloat()
+            if (w <= 0f || h <= 0f) return
+
+            val bars = 28
+            val padH = dpF(16f)
+            val step = (w - padH * 2f) / (bars - 1)
+            val cy = h * 0.5f
+
+            if (isAnimatingWaves) {
+                phase += 0.35f
+            }
+
+            for (i in 0 until bars) {
+                val bx = padH + i * step
+                val wave = if (isAnimatingWaves) {
+                    (abs(sin((phase + i * 0.45f).toDouble())).toFloat() * 0.75f + 0.18f)
+                } else {
+                    0.18f
+                }
+                val halfBar = (h * 0.44f * wave).coerceAtLeast(dpF(3f))
+                barPaint.color = if (i % 2 == 0) colorBrandIceBlue else colorSamsungBlue
+                canvas.drawLine(bx, cy - halfBar, bx, cy + halfBar, barPaint)
+            }
         }
     }
 
@@ -5714,7 +7547,26 @@ class MainActivity : Activity() {
             SHARE,
             EDIT_PEN,
             LOCK,
-            FINGERPRINT
+            FINGERPRINT,
+            AUDIO_WAVE,
+            UNDO_CURVE,
+            REDO_CURVE,
+            TAB_CROP_ROTATE,
+            TAB_THREE_CIRCLES,
+            TONE_SUN,
+            TONE_EXPOSURE,
+            TONE_CONTRAST,
+            TONE_SATURATION,
+            TONE_WARMTH,
+            TAB_SMILEY_PEN,
+            TAB_FOUR_DOTS,
+            STRAIGHTEN_TILT,
+            PERSP_HORIZONTAL,
+            PERSP_VERTICAL,
+            ERASER_BOX,
+            LASSO_SCISSORS,
+            EYEDROPPER,
+            PALETTE_MIX
         }
 
         private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -5904,6 +7756,131 @@ class MainActivity : Activity() {
                     rect.set(cx - r * 0.92f, cy - r * 0.95f, cx + r * 0.92f, cy + r * 0.95f)
                     canvas.drawArc(rect, 210f, 120f, false, strokePaint)
                     canvas.drawLine(cx, cy - r * 0.05f, cx, cy + r * 0.85f, strokePaint)
+                }
+                IconType.AUDIO_WAVE -> {
+                    canvas.drawLine(cx - r * 0.75f, cy - r * 0.3f, cx - r * 0.75f, cy + r * 0.3f, strokePaint)
+                    canvas.drawLine(cx - r * 0.25f, cy - r * 0.85f, cx - r * 0.25f, cy + r * 0.85f, strokePaint)
+                    canvas.drawLine(cx + r * 0.25f, cy - r * 0.55f, cx + r * 0.25f, cy + r * 0.55f, strokePaint)
+                    canvas.drawLine(cx + r * 0.75f, cy - r * 0.25f, cx + r * 0.75f, cy + r * 0.25f, strokePaint)
+                }
+                IconType.UNDO_CURVE -> {
+                    rect.set(cx - r * 0.7f, cy - r * 0.4f, cx + r * 0.7f, cy + r * 0.8f)
+                    canvas.drawArc(rect, 190f, 160f, false, strokePaint)
+                    canvas.drawLine(cx - r * 0.75f, cy + r * 0.1f, cx - r * 0.35f, cy - r * 0.3f, strokePaint)
+                    canvas.drawLine(cx - r * 0.75f, cy + r * 0.1f, cx - r * 0.3f, cy + r * 0.35f, strokePaint)
+                }
+                IconType.REDO_CURVE -> {
+                    rect.set(cx - r * 0.7f, cy - r * 0.4f, cx + r * 0.7f, cy + r * 0.8f)
+                    canvas.drawArc(rect, 190f, 160f, false, strokePaint)
+                    canvas.drawLine(cx + r * 0.75f, cy + r * 0.1f, cx + r * 0.35f, cy - r * 0.3f, strokePaint)
+                    canvas.drawLine(cx + r * 0.75f, cy + r * 0.1f, cx + r * 0.3f, cy + r * 0.35f, strokePaint)
+                }
+                IconType.TAB_CROP_ROTATE -> {
+                    rect.set(cx - r * 0.65f, cy - r * 0.65f, cx + r * 0.65f, cy + r * 0.65f)
+                    canvas.drawRect(rect, strokePaint)
+                    canvas.drawLine(cx - r * 0.95f, cy - r * 0.65f, cx - r * 0.65f, cy - r * 0.65f, strokePaint)
+                    canvas.drawLine(cx + r * 0.65f, cy + r * 0.65f, cx + r * 0.95f, cy + r * 0.65f, strokePaint)
+                }
+                IconType.TAB_THREE_CIRCLES -> {
+                    val cr = r * 0.52f
+                    canvas.drawCircle(cx, cy - r * 0.34f, cr, strokePaint)
+                    canvas.drawCircle(cx - r * 0.36f, cy + r * 0.32f, cr, strokePaint)
+                    canvas.drawCircle(cx + r * 0.36f, cy + r * 0.32f, cr, strokePaint)
+                }
+                IconType.TONE_SUN -> {
+                    canvas.drawCircle(cx, cy, r * 0.48f, strokePaint)
+                    for (i in 0 until 8) {
+                        val a = Math.toRadians((i * 45).toDouble())
+                        val x1 = cx + (r * 0.72f * cos(a)).toFloat()
+                        val y1 = cy + (r * 0.72f * sin(a)).toFloat()
+                        val x2 = cx + (r * 0.94f * cos(a)).toFloat()
+                        val y2 = cy + (r * 0.94f * sin(a)).toFloat()
+                        canvas.drawLine(x1, y1, x2, y2, strokePaint)
+                    }
+                }
+                IconType.TONE_EXPOSURE -> {
+                    canvas.drawCircle(cx, cy, r * 0.85f, strokePaint)
+                    canvas.drawLine(cx - r * 0.55f, cy + r * 0.55f, cx + r * 0.55f, cy - r * 0.55f, strokePaint)
+                }
+                IconType.TONE_CONTRAST -> {
+                    canvas.drawCircle(cx, cy, r * 0.82f, strokePaint)
+                    rect.set(cx - r * 0.82f, cy - r * 0.82f, cx + r * 0.82f, cy + r * 0.82f)
+                    canvas.drawArc(rect, -90f, 180f, true, fillPaint)
+                }
+                IconType.TONE_SATURATION -> {
+                    path.moveTo(cx, cy - r * 0.88f)
+                    path.cubicTo(cx + r * 0.85f, cy + r * 0.1f, cx + r * 0.65f, cy + r * 0.9f, cx, cy + r * 0.9f)
+                    path.cubicTo(cx - r * 0.65f, cy + r * 0.9f, cx - r * 0.85f, cy + r * 0.1f, cx, cy - r * 0.88f)
+                    canvas.drawPath(path, strokePaint)
+                }
+                IconType.TONE_WARMTH -> {
+                    canvas.drawLine(cx, cy - r * 0.85f, cx, cy + r * 0.45f, strokePaint)
+                    canvas.drawCircle(cx, cy + r * 0.55f, r * 0.32f, strokePaint)
+                }
+                IconType.TAB_SMILEY_PEN -> {
+                    rect.set(cx - r * 0.85f, cy - r * 0.85f, cx + r * 0.85f, cy + r * 0.85f)
+                    canvas.drawRoundRect(rect, r * 0.35f, r * 0.35f, strokePaint)
+                    canvas.drawCircle(cx - r * 0.28f, cy - r * 0.2f, r * 0.09f, fillPaint)
+                    canvas.drawCircle(cx + r * 0.28f, cy - r * 0.2f, r * 0.09f, fillPaint)
+                    rect.set(cx - r * 0.35f, cy - r * 0.1f, cx + r * 0.35f, cy + r * 0.4f)
+                    canvas.drawArc(rect, 20f, 140f, false, strokePaint)
+                }
+                IconType.TAB_FOUR_DOTS -> {
+                    val dr = r * 0.32f
+                    val off = r * 0.48f
+                    canvas.drawCircle(cx - off, cy - off, dr, strokePaint)
+                    canvas.drawCircle(cx + off, cy - off, dr, strokePaint)
+                    canvas.drawCircle(cx - off, cy + off, dr, strokePaint)
+                    canvas.drawCircle(cx + off, cy + off, dr, strokePaint)
+                }
+                IconType.STRAIGHTEN_TILT -> {
+                    rect.set(cx - r * 0.65f, cy - r * 0.45f, cx + r * 0.65f, cy + r * 0.45f)
+                    canvas.save()
+                    canvas.rotate(-12f, cx, cy)
+                    canvas.drawRoundRect(rect, r * 0.15f, r * 0.15f, strokePaint)
+                    canvas.restore()
+                    canvas.drawLine(cx - r * 0.9f, cy, cx + r * 0.9f, cy, strokePaint)
+                }
+                IconType.PERSP_HORIZONTAL -> {
+                    path.moveTo(cx - r * 0.7f, cy - r * 0.45f)
+                    path.lineTo(cx + r * 0.7f, cy - r * 0.7f)
+                    path.lineTo(cx + r * 0.7f, cy + r * 0.7f)
+                    path.lineTo(cx - r * 0.7f, cy + r * 0.45f)
+                    path.close()
+                    canvas.drawPath(path, strokePaint)
+                    canvas.drawLine(cx - r * 0.7f, cy, cx + r * 0.7f, cy, strokePaint)
+                }
+                IconType.PERSP_VERTICAL -> {
+                    path.moveTo(cx - r * 0.45f, cy - r * 0.7f)
+                    path.lineTo(cx + r * 0.45f, cy - r * 0.7f)
+                    path.lineTo(cx + r * 0.75f, cy + r * 0.7f)
+                    path.lineTo(cx - r * 0.75f, cy + r * 0.7f)
+                    path.close()
+                    canvas.drawPath(path, strokePaint)
+                    canvas.drawLine(cx, cy - r * 0.7f, cx, cy + r * 0.7f, strokePaint)
+                }
+                IconType.ERASER_BOX -> {
+                    canvas.save()
+                    canvas.rotate(-35f, cx, cy)
+                    rect.set(cx - r * 0.65f, cy - r * 0.4f, cx + r * 0.65f, cy + r * 0.4f)
+                    canvas.drawRoundRect(rect, r * 0.18f, r * 0.18f, strokePaint)
+                    canvas.drawLine(cx, cy - r * 0.4f, cx, cy + r * 0.4f, strokePaint)
+                    canvas.restore()
+                }
+                IconType.LASSO_SCISSORS -> {
+                    canvas.drawCircle(cx, cy - r * 0.1f, r * 0.72f, strokePaint)
+                    canvas.drawLine(cx - r * 0.55f, cy + r * 0.45f, cx + r * 0.15f, cy + r * 0.88f, strokePaint)
+                    canvas.drawLine(cx + r * 0.15f, cy + r * 0.45f, cx - r * 0.55f, cy + r * 0.88f, strokePaint)
+                }
+                IconType.EYEDROPPER -> {
+                    canvas.drawLine(cx - r * 0.65f, cy + r * 0.65f, cx + r * 0.25f, cy - r * 0.25f, strokePaint)
+                    canvas.drawCircle(cx + r * 0.45f, cy - r * 0.45f, r * 0.3f, fillPaint)
+                }
+                IconType.PALETTE_MIX -> {
+                    canvas.drawCircle(cx, cy, r * 0.85f, strokePaint)
+                    canvas.drawCircle(cx - r * 0.32f, cy - r * 0.25f, r * 0.12f, fillPaint)
+                    canvas.drawCircle(cx + r * 0.25f, cy - r * 0.32f, r * 0.12f, fillPaint)
+                    canvas.drawCircle(cx + r * 0.35f, cy + r * 0.2f, r * 0.12f, fillPaint)
                 }
             }
         }
