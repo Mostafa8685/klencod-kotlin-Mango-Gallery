@@ -1,14 +1,32 @@
 package com.m3rd.app
 
 import android.Manifest
+import android.app.RecoverableSecurityException
+import android.provider.Settings
+import android.util.Base64
+import android.view.HapticFeedbackConstants
+import android.view.WindowManager
+import android.widget.SectionIndexer
+import java.security.MessageDigest
+import java.security.SecureRandom
+import java.util.concurrent.atomic.AtomicBoolean
+import javax.crypto.SecretKeyFactory
+import javax.crypto.spec.PBEKeySpec
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
+import android.animation.ValueAnimator
 import android.content.SharedPreferences
+import android.content.pm.ActivityInfo
+import android.database.ContentObserver
+import android.media.MediaScannerConnection
 import android.content.pm.PackageManager
+import android.media.AudioManager
 import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -224,6 +242,7 @@ class MainActivity : Activity() {
     private lateinit var miniAudioPlayerBar: LinearLayout
     private lateinit var bottomNavContainer: LinearLayout
     private lateinit var overlayLayer: FrameLayout
+    private lateinit var floatingPipLayer: FrameLayout
     private lateinit var lockLayer: FrameLayout
 
     private val handler = Handler(Looper.getMainLooper())
@@ -246,7 +265,8 @@ class MainActivity : Activity() {
     // التبويب الحالي: 0 = الصور، 1 = ألبومات، 2 = القصص
     private var currentTab = 0
     private var picturesColumnCount = 3
-    private var picturesQuickFilter = 0 // 0=الكل, 1=الصور فقط, 2=الفيديوهات, 3=المفضلة
+    private var albumsColumnCount = 3 // يدعم التكبير والتصغير بإصبعين (2، 3، 4 أعمدة كما في 1000036343.png)
+    private var isMultiTouchPinching = false
 
     private var activeAlbumDetail: AlbumInfo? = null
     private var activeSubPageTitle: String? = null
@@ -288,7 +308,21 @@ class MainActivity : Activity() {
 
     // قفل الاستديو وسلة المهملات (30 يوماً)
     private var appLockEnabled = false
-    private var appLockPin = ""
+    private var appLockPin = ""            // يُخزَّن هنا hash مملّح (v2|algo|salt|hash) وليس كلمة السر نفسها
+    private var appLockPinLen = 0
+    private var failedUnlockAttempts = 0
+    private var lockoutUntilMs = 0L
+    private var lastStopAtMs = 0L
+    private var skipRelockUntilMs = 0L
+    private val relockGraceMs = 15_000L
+    private var pendingDeleteIds: List<String> = emptyList()
+    private var batchDeletedCount = 0
+    private val REQ_SYSTEM_DELETE = 4101
+    private val REQ_SYSTEM_DELETE_LEGACY = 4102
+    private val isLoadingMedia = AtomicBoolean(false)
+    private val reloadQueued = AtomicBoolean(false)
+    private var audioLoadToken = 0
+    private var activePicturesListView: ListView? = null
     private var appLockBiometric = true
     private var isAppLockedNow = false
     private val trashRetentionMs = 30L * 24L * 60L * 60L * 1000L
@@ -297,8 +331,11 @@ class MainActivity : Activity() {
     private var isSlideshowRunning = false
     private var slideshowRunnable: Runnable? = null
 
-    // كاشف إيماءة التكبير/التصغير بإصبعين على شبكة الصور
+    // كواشف إيماءة التكبير/التصغير بإصبعين على شبكة الصور وشبكة الألبومات
     private lateinit var gridScaleDetector: ScaleGestureDetector
+    private lateinit var albumsScaleDetector: ScaleGestureDetector
+    private var mediaContentObserver: ContentObserver? = null
+    private val observerReloadRunnable = Runnable { loadDeviceMediaAsync() }
 
     // ============================================================
     // دوال القياس والأرقام العربية
@@ -344,7 +381,7 @@ class MainActivity : Activity() {
 
         prefs = getSharedPreferences("samsung_gallery_oneui_prefs", Context.MODE_PRIVATE)
         loadPersistedState()
-        purgeExpiredTrashItems()
+        applySecureFlag()
         applySystemBarsTheme()
 
         // تخصيص 25% من ذاكرة التطبيق للكاش السريع للصور المصغرة والصور العالية الدقة
@@ -357,16 +394,50 @@ class MainActivity : Activity() {
             this,
             object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
                 private var accumulatedScale = 1f
+                override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
+                    isMultiTouchPinching = true
+                    accumulatedScale = 1f
+                    return true
+                }
                 override fun onScale(detector: ScaleGestureDetector): Boolean {
                     accumulatedScale *= detector.scaleFactor
-                    if (accumulatedScale > 1.32f && picturesColumnCount > 2) {
+                    if (accumulatedScale > 1.28f && picturesColumnCount > 2) {
                         picturesColumnCount--
                         accumulatedScale = 1f
                         savePersistedState()
                         renderActiveScreen()
                         return true
-                    } else if (accumulatedScale < 0.74f && picturesColumnCount < 5) {
+                    } else if (accumulatedScale < 0.76f && picturesColumnCount < 5) {
                         picturesColumnCount++
+                        accumulatedScale = 1f
+                        savePersistedState()
+                        renderActiveScreen()
+                        return true
+                    }
+                    return false
+                }
+            }
+        )
+
+        albumsScaleDetector = ScaleGestureDetector(
+            this,
+            object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                private var accumulatedScale = 1f
+                override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
+                    isMultiTouchPinching = true
+                    accumulatedScale = 1f
+                    return true
+                }
+                override fun onScale(detector: ScaleGestureDetector): Boolean {
+                    accumulatedScale *= detector.scaleFactor
+                    if (accumulatedScale > 1.28f && albumsColumnCount > 2) {
+                        albumsColumnCount--
+                        accumulatedScale = 1f
+                        savePersistedState()
+                        renderActiveScreen()
+                        return true
+                    } else if (accumulatedScale < 0.76f && albumsColumnCount < 4) {
+                        albumsColumnCount++
                         accumulatedScale = 1f
                         savePersistedState()
                         renderActiveScreen()
@@ -425,6 +496,12 @@ class MainActivity : Activity() {
         }
         rootStack.addView(overlayLayer, FrameLayout.LayoutParams(-1, -1))
 
+        floatingPipLayer = FrameLayout(this).apply {
+            visibility = View.GONE
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+        rootStack.addView(floatingPipLayer, FrameLayout.LayoutParams(-1, -1))
+
         lockLayer = FrameLayout(this).apply {
             visibility = View.GONE
             layoutDirection = View.LAYOUT_DIRECTION_LTR
@@ -440,7 +517,79 @@ class MainActivity : Activity() {
             lockGalleryNow(autoPromptBiometric = true)
         }
 
+        registerLiveMediaStoreObserver()
         requestMediaPermissionsIfNeeded()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        val now = System.currentTimeMillis()
+        if (lastStopAtMs > 0L && appLockEnabled && appLockPin.isNotEmpty() && !isAppLockedNow) {
+            val skip = now <= skipRelockUntilMs
+            if (!skip && (now - lastStopAtMs) >= relockGraceMs) {
+                lockGalleryNow(autoPromptBiometric = true)
+            }
+        }
+        skipRelockUntilMs = 0L
+    }
+
+    override fun onStop() {
+        super.onStop()
+        lastStopAtMs = System.currentTimeMillis()
+        if (isSlideshowRunning) stopSlideshow()
+        pauseVideoViewsIn(overlayLayer)
+        pauseVideoViewsIn(floatingPipLayer)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (hasMediaPermission()) {
+            loadDeviceMediaAsync()
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        handler.removeCallbacksAndMessages(null)
+        try { thumbExecutor.shutdownNow() } catch (_: Exception) {}
+        try { viewerExecutor.shutdownNow() } catch (_: Exception) {}
+        mediaContentObserver?.let {
+            try {
+                contentResolver.unregisterContentObserver(it)
+            } catch (_: Exception) {}
+        }
+        try {
+            audioPlayer?.release()
+        } catch (_: Exception) {}
+    }
+
+    private fun registerLiveMediaStoreObserver() {
+        if (mediaContentObserver != null) return
+        val obs = object : ContentObserver(handler) {
+            override fun onChange(selfChange: Boolean, uri: Uri?) {
+                super.onChange(selfChange, uri)
+                handler.removeCallbacks(observerReloadRunnable)
+                handler.postDelayed(observerReloadRunnable, 180L)
+            }
+        }
+        mediaContentObserver = obs
+        try {
+            contentResolver.registerContentObserver(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                true,
+                obs
+            )
+            contentResolver.registerContentObserver(
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                true,
+                obs
+            )
+            contentResolver.registerContentObserver(
+                MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                true,
+                obs
+            )
+        } catch (_: Exception) {}
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
@@ -554,9 +703,19 @@ class MainActivity : Activity() {
 
         showCustomizeAlbumsBanner = prefs.getBoolean("show_customize_banner", true)
         picturesColumnCount = prefs.getInt("pictures_col_count", 3).coerceIn(2, 5)
+        albumsColumnCount = prefs.getInt("albums_col_count", 3).coerceIn(2, 4)
         themeMode = prefs.getInt("theme_mode", 0)
         appLockEnabled = prefs.getBoolean("app_lock_enabled", false)
         appLockPin = prefs.getString("app_lock_pin", "") ?: ""
+        appLockPinLen = prefs.getInt("app_lock_pin_len", 0)
+        failedUnlockAttempts = prefs.getInt("lock_fail_count", 0)
+        lockoutUntilMs = prefs.getLong("lock_until_ms", 0L)
+        if (appLockPin.isNotEmpty() && !appLockPin.startsWith("v2|")) {
+            // ترحيل كلمة السر القديمة (نص عادي) إلى hash مملّح
+            appLockPinLen = appLockPin.length
+            appLockPin = try { hashPinForStorage(appLockPin) } catch (_: Exception) { "" }
+            prefs.edit().putString("app_lock_pin", appLockPin).putInt("app_lock_pin_len", appLockPinLen).apply()
+        }
         appLockBiometric = prefs.getBoolean("app_lock_biometric", true)
 
         val customAlbumsRaw = prefs.getStringSet("custom_albums_names", emptySet()) ?: emptySet()
@@ -594,9 +753,11 @@ class MainActivity : Activity() {
             .putStringSet("renamed_items_map", serializedRenames)
             .putBoolean("show_customize_banner", showCustomizeAlbumsBanner)
             .putInt("pictures_col_count", picturesColumnCount)
+            .putInt("albums_col_count", albumsColumnCount)
             .putInt("theme_mode", themeMode)
             .putBoolean("app_lock_enabled", appLockEnabled)
             .putString("app_lock_pin", appLockPin)
+            .putInt("app_lock_pin_len", appLockPinLen)
             .putBoolean("app_lock_biometric", appLockBiometric)
             .putStringSet("custom_albums_names", customAlbumMap.keys.toSet())
 
@@ -604,6 +765,97 @@ class MainActivity : Activity() {
             editor.putStringSet("custom_album_$name", list.toSet())
         }
         editor.apply()
+        applySecureFlag()
+    }
+
+    // ============================================================
+    // أمان القفل: تجزئة كلمة السر + حماية من التخمين + FLAG_SECURE
+    // ============================================================
+    private fun pbkdf2(pin: String, salt: ByteArray, algo: String): ByteArray {
+        val spec = PBEKeySpec(pin.toCharArray(), salt, 30_000, 256)
+        return SecretKeyFactory.getInstance(algo).generateSecret(spec).encoded
+    }
+
+    private fun hashPinForStorage(pin: String): String {
+        val salt = ByteArray(16).also { SecureRandom().nextBytes(it) }
+        val algo = if (Build.VERSION.SDK_INT >= 26) "PBKDF2WithHmacSHA256" else "PBKDF2WithHmacSHA1"
+        val hash = pbkdf2(pin, salt, algo)
+        return "v2|" + algo + "|" + Base64.encodeToString(salt, Base64.NO_WRAP) + "|" +
+            Base64.encodeToString(hash, Base64.NO_WRAP)
+    }
+
+    private fun verifyPin(input: String): Boolean {
+        val stored = appLockPin
+        if (stored.isEmpty() || input.isEmpty()) return false
+        return try {
+            val parts = stored.split("|")
+            if (parts.size != 4 || parts[0] != "v2") {
+                false
+            } else {
+                val salt = Base64.decode(parts[2], Base64.NO_WRAP)
+                val expected = Base64.decode(parts[3], Base64.NO_WRAP)
+                MessageDigest.isEqual(expected, pbkdf2(input, salt, parts[1]))
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun verifyPinIfComplete(entered: String): Boolean =
+        appLockPinLen > 0 && entered.length >= appLockPinLen && verifyPin(entered)
+
+    private fun lockoutRemainingMs(): Long {
+        val now = System.currentTimeMillis()
+        // حماية من العبث بالساعة: لا نسمح بقفل أطول من ساعتين
+        if (lockoutUntilMs - now > 2L * 60L * 60L * 1000L) lockoutUntilMs = now + 15L * 60L * 1000L
+        return (lockoutUntilMs - now).coerceAtLeast(0L)
+    }
+
+    private fun registerFailedAttempt() {
+        failedUnlockAttempts++
+        if (failedUnlockAttempts >= 5) {
+            val step = (failedUnlockAttempts - 5).coerceAtMost(5)
+            lockoutUntilMs = System.currentTimeMillis() + (30L shl step) * 1000L
+        }
+        prefs.edit()
+            .putInt("lock_fail_count", failedUnlockAttempts)
+            .putLong("lock_until_ms", lockoutUntilMs)
+            .apply()
+    }
+
+    private fun resetFailedAttempts() {
+        failedUnlockAttempts = 0
+        lockoutUntilMs = 0L
+        prefs.edit().putInt("lock_fail_count", 0).putLong("lock_until_ms", 0L).apply()
+    }
+
+    private fun lockoutMessage(waitMs: Long): String =
+        "محاولات كثيرة خاطئة، انتظر ${toArabicDigits(((waitMs + 999L) / 1000L).toInt())} ثانية"
+
+    private fun applySecureFlag() {
+        try {
+            if (appLockEnabled && appLockPin.isNotEmpty()) {
+                window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+            } else {
+                window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun markExternalLaunch() {
+        skipRelockUntilMs = System.currentTimeMillis() + 120_000L
+    }
+
+    private fun pauseVideoViewsIn(v: View?) {
+        if (v == null) return
+        if (v is VideoView) {
+            try { if (v.isPlaying) v.pause() } catch (_: Exception) {}
+            return
+        }
+        if (v is ViewGroup) {
+            for (i in 0 until v.childCount) pauseVideoViewsIn(v.getChildAt(i))
+        }
     }
 
     private fun refreshCachedVisibleItems() {
@@ -625,16 +877,166 @@ class MainActivity : Activity() {
     }
 
     private fun permanentlyDeleteItem(id: String) {
-        trashedIds.remove(id)
-        trashedTimestamps.remove(id)
-        permanentlyDeletedIds.add(id)
-        refreshCachedVisibleItems()
-        val item = deviceMediaItems.find { it.id == id }
-        if (item != null) {
+        permanentlyDeleteItems(listOf(id))
+    }
+
+    /** حذف حقيقي من الجهاز عبر نظام أندرويد؛ لا يُعلَّم العنصر محذوفاً إلا بعد نجاح الحذف فعلاً. */
+    private fun permanentlyDeleteItems(ids: List<String>) {
+        if (ids.isEmpty()) return
+        val items = ids.mapNotNull { id -> deviceMediaItems.find { it.id == id } }
+        val foundIds = items.map { it.id }.toSet()
+        for (id in ids) {
+            if (id !in foundIds) finalizeDeletedId(id)
+        }
+        if (items.isEmpty()) {
+            onDeleteBatchFinished()
+            return
+        }
+        pendingDeleteIds = items.map { it.id }
+        if (Build.VERSION.SDK_INT >= 31 && MediaStore.canManageMedia(this)) {
+            processLegacyDeleteQueue()
+        } else if (Build.VERSION.SDK_INT >= 30) {
+            requestSystemDeleteDialog()
+        } else {
+            processLegacyDeleteQueue()
+        }
+    }
+
+    private fun requestSystemDeleteDialog() {
+        if (Build.VERSION.SDK_INT < 30) {
+            pendingDeleteIds = emptyList()
+            onDeleteBatchFinished()
+            return
+        }
+        val uris = pendingDeleteIds.mapNotNull { id -> deviceMediaItems.find { it.id == id }?.contentUri }
+        if (uris.isEmpty()) {
+            pendingDeleteIds = emptyList()
+            onDeleteBatchFinished()
+            return
+        }
+        try {
+            val pi = MediaStore.createDeleteRequest(contentResolver, uris)
+            markExternalLaunch()
+            startIntentSenderForResult(pi.intentSender, REQ_SYSTEM_DELETE, null, 0, 0, 0)
+        } catch (_: Exception) {
+            pendingDeleteIds = emptyList()
+            Toast.makeText(this, "تعذر طلب الحذف من النظام", Toast.LENGTH_SHORT).show()
+            onDeleteBatchFinished()
+        }
+    }
+
+    private fun processLegacyDeleteQueue() {
+        while (pendingDeleteIds.isNotEmpty()) {
+            val id = pendingDeleteIds.first()
+            val item = deviceMediaItems.find { it.id == id }
+            if (item == null) {
+                finalizeDeletedId(id)
+                pendingDeleteIds = pendingDeleteIds.drop(1)
+                continue
+            }
             try {
                 contentResolver.delete(item.contentUri, null, null)
+                finalizeDeletedId(id)
+                pendingDeleteIds = pendingDeleteIds.drop(1)
+            } catch (e: SecurityException) {
+                if (Build.VERSION.SDK_INT >= 30) {
+                    requestSystemDeleteDialog()
+                    return
+                }
+                if (Build.VERSION.SDK_INT >= 29) {
+                    val rse = e as? RecoverableSecurityException
+                    if (rse != null) {
+                        try {
+                            markExternalLaunch()
+                            startIntentSenderForResult(
+                                rse.userAction.actionIntent.intentSender,
+                                REQ_SYSTEM_DELETE_LEGACY, null, 0, 0, 0
+                            )
+                            return
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
+                pendingDeleteIds = pendingDeleteIds.drop(1)
             } catch (_: Exception) {
+                pendingDeleteIds = pendingDeleteIds.drop(1)
             }
+        }
+        onDeleteBatchFinished()
+    }
+
+    private fun finalizeDeletedId(id: String) {
+        trashedIds.remove(id)
+        trashedTimestamps.remove(id)
+        favoriteIds.remove(id)
+        customNamesMap.remove(id)
+        permanentlyDeletedIds.remove(id)
+        for (list in customAlbumMap.values) list.remove(id)
+        deviceMediaItems.removeAll { it.id == id }
+        batchDeletedCount++
+        refreshCachedVisibleItems()
+    }
+
+    private fun onDeleteBatchFinished() {
+        savePersistedState()
+        refreshCachedVisibleItems()
+        if (batchDeletedCount > 0) {
+            Toast.makeText(
+                this,
+                "تم الحذف نهائياً (${toArabicDigits(batchDeletedCount)} عنصر)",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+        batchDeletedCount = 0
+        if (activeSubPageTitle == "سلة المحذوفات") openRecycleBinSubPage() else renderActiveScreen()
+        loadDeviceMediaAsync()
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        when (requestCode) {
+            REQ_SYSTEM_DELETE -> {
+                if (resultCode == RESULT_OK) {
+                    for (id in pendingDeleteIds) finalizeDeletedId(id)
+                } else {
+                    Toast.makeText(this, "تم إلغاء الحذف", Toast.LENGTH_SHORT).show()
+                }
+                pendingDeleteIds = emptyList()
+                onDeleteBatchFinished()
+            }
+            REQ_SYSTEM_DELETE_LEGACY -> {
+                if (resultCode == RESULT_OK) {
+                    processLegacyDeleteQueue()
+                } else {
+                    pendingDeleteIds = emptyList()
+                    onDeleteBatchFinished()
+                }
+            }
+        }
+    }
+
+    /** عناصر "حُذفت نهائياً" في النسخة القديمة لكن ملفاتها ما زالت على الجهاز ترجع إلى السلة بدل أن تبقى مخفية للأبد. */
+    private fun migrateLegacyPermanentDeletes() {
+        if (permanentlyDeletedIds.isEmpty()) return
+        val existing = deviceMediaItems.map { it.id }.toHashSet()
+        val now = System.currentTimeMillis()
+        var moved = 0
+        for (id in permanentlyDeletedIds.toList()) {
+            if (id in existing) {
+                trashedIds.add(id)
+                trashedTimestamps[id] = now
+                moved++
+            }
+        }
+        permanentlyDeletedIds.clear()
+        savePersistedState()
+        if (moved > 0) {
+            Toast.makeText(
+                this,
+                "تمت إعادة ${toArabicDigits(moved)} عنصر لم يُحذف فعلياً إلى سلة المحذوفات",
+                Toast.LENGTH_LONG
+            ).show()
         }
     }
 
@@ -642,13 +1044,27 @@ class MainActivity : Activity() {
         val now = System.currentTimeMillis()
         val expired = trashedIds.filter { id ->
             val deletedAt = trashedTimestamps[id] ?: now
-            (now - deletedAt) >= trashRetentionMs
+            (now - deletedAt) >= trashRetentionMs && deviceMediaItems.any { it.id == id }
         }
-        if (expired.isNotEmpty()) {
-            for (id in expired) {
-                permanentlyDeleteItem(id)
+        if (expired.isEmpty()) return
+        val canSilent = Build.VERSION.SDK_INT >= 31 && MediaStore.canManageMedia(this)
+        val lastPrompt = prefs.getLong("last_purge_prompt_ms", 0L)
+        val minGap = if (canSilent) 60_000L else 86_400_000L
+        if (now - lastPrompt < minGap) return
+        prefs.edit().putLong("last_purge_prompt_ms", now).apply()
+        permanentlyDeleteItems(expired)
+    }
+
+    private fun openManageMediaSettings() {
+        if (Build.VERSION.SDK_INT >= 31) {
+            try {
+                markExternalLaunch()
+                startActivity(Intent(Settings.ACTION_REQUEST_MANAGE_MEDIA, Uri.parse("package:$packageName")))
+            } catch (_: Exception) {
+                Toast.makeText(this, "تعذر فتح إعدادات إدارة الوسائط", Toast.LENGTH_SHORT).show()
             }
-            savePersistedState()
+        } else {
+            Toast.makeText(this, "هذه الميزة غير مطلوبة على إصدار أندرويد هذا", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -665,7 +1081,9 @@ class MainActivity : Activity() {
     private fun hasMediaPermission(): Boolean {
         return if (Build.VERSION.SDK_INT >= 33) {
             checkSelfPermission(Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED ||
-                checkSelfPermission(Manifest.permission.READ_MEDIA_VIDEO) == PackageManager.PERMISSION_GRANTED
+                checkSelfPermission(Manifest.permission.READ_MEDIA_VIDEO) == PackageManager.PERMISSION_GRANTED ||
+                (Build.VERSION.SDK_INT >= 34 &&
+                    checkSelfPermission(Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED) == PackageManager.PERMISSION_GRANTED)
         } else {
             checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
         }
@@ -677,7 +1095,7 @@ class MainActivity : Activity() {
                 Manifest.permission.READ_MEDIA_IMAGES,
                 Manifest.permission.READ_MEDIA_VIDEO,
                 Manifest.permission.READ_MEDIA_AUDIO
-            )
+            ) + (if (Build.VERSION.SDK_INT >= 34) arrayOf(Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED) else arrayOf<String>())
         } else {
             arrayOf(
                 Manifest.permission.READ_EXTERNAL_STORAGE,
@@ -689,9 +1107,14 @@ class MainActivity : Activity() {
             checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
         }
 
-        if (missing.isEmpty()) {
+        val partialOnly = Build.VERSION.SDK_INT >= 34 &&
+            checkSelfPermission(Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED) == PackageManager.PERMISSION_GRANTED &&
+            checkSelfPermission(Manifest.permission.READ_MEDIA_IMAGES) != PackageManager.PERMISSION_GRANTED &&
+            checkSelfPermission(Manifest.permission.READ_MEDIA_VIDEO) != PackageManager.PERMISSION_GRANTED
+        if (missing.isEmpty() || partialOnly) {
             loadDeviceMediaAsync()
         } else {
+            markExternalLaunch()
             requestPermissions(missing.toTypedArray(), 1001)
         }
     }
@@ -707,11 +1130,23 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun normalizeMediaTimestampMs(rawValue: Long, nowMs: Long): Long {
+        if (rawValue <= 0L) return 0L
+        val ms = if (rawValue < 10_000_000_000L) rawValue * 1000L else rawValue
+        // منع أي تاريخ مستقبلي خاطئ في بيانات الملف من إخفاء الصور الحديثة الحقيقية
+        return if (ms > nowMs + 300_000L) nowMs else ms
+    }
+
     @Suppress("DEPRECATION")
     private fun loadDeviceMediaAsync() {
+        if (!isLoadingMedia.compareAndSet(false, true)) {
+            reloadQueued.set(true)
+            return
+        }
         Thread {
             val loaded = mutableListOf<MediaItem>()
             try {
+                val nowMs = System.currentTimeMillis()
                 val calToday = Calendar.getInstance().apply {
                     set(Calendar.HOUR_OF_DAY, 0)
                     set(Calendar.MINUTE, 0)
@@ -729,12 +1164,13 @@ class MainActivity : Activity() {
                 val yearDateFmt = SimpleDateFormat("d MMMM yyyy", Locale("ar"))
                 val fullTimeFmt = SimpleDateFormat("d MMMM yyyy • hh:mm a", Locale("ar"))
 
-                // 1. قراءة الصور الحقيقية مع زاوية التوجيه (ORIENTATION)
+                // 1. قراءة جميع صور الهاتف الحقيقية مع حساب أحدث تاريخ فعلي (DATE_ADDED / DATE_MODIFIED / DATE_TAKEN)
                 val imgProjection = arrayOf(
                     MediaStore.Images.Media._ID,
                     MediaStore.Images.Media.DISPLAY_NAME,
-                    MediaStore.Images.Media.DATE_MODIFIED,
                     MediaStore.Images.Media.DATE_ADDED,
+                    MediaStore.Images.Media.DATE_MODIFIED,
+                    MediaStore.Images.Media.DATE_TAKEN,
                     MediaStore.Images.Media.BUCKET_DISPLAY_NAME,
                     MediaStore.Images.Media.WIDTH,
                     MediaStore.Images.Media.HEIGHT,
@@ -747,12 +1183,13 @@ class MainActivity : Activity() {
                     imgProjection,
                     null,
                     null,
-                    "${MediaStore.Images.Media.DATE_MODIFIED} DESC"
+                    "${MediaStore.Images.Media.DATE_ADDED} DESC, ${MediaStore.Images.Media._ID} DESC"
                 )?.use { cursor ->
                     val idCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
                     val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
-                    val modCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_MODIFIED)
                     val addCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_ADDED)
+                    val modCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_MODIFIED)
+                    val takenCol = cursor.getColumnIndex(MediaStore.Images.Media.DATE_TAKEN)
                     val bucketCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.BUCKET_DISPLAY_NAME)
                     val wCol = cursor.getColumnIndex(MediaStore.Images.Media.WIDTH)
                     val hCol = cursor.getColumnIndex(MediaStore.Images.Media.HEIGHT)
@@ -765,8 +1202,13 @@ class MainActivity : Activity() {
                         val itemId = "img_$id"
                         val rawName = cursor.getString(nameCol) ?: "صورة_$id.jpg"
                         val displayName = customNamesMap[itemId] ?: rawName
-                        val rawSec = cursor.getLong(modCol).let { if (it > 0L) it else cursor.getLong(addCol) }
-                        val timeMs = if (rawSec > 100_000_000_000L) rawSec else rawSec * 1000L
+
+                        val addedMs = normalizeMediaTimestampMs(cursor.getLong(addCol), nowMs)
+                        val modMs = normalizeMediaTimestampMs(cursor.getLong(modCol), nowMs)
+                        val takenMs = if (takenCol >= 0) normalizeMediaTimestampMs(cursor.getLong(takenCol), nowMs) else 0L
+                        // نأخذ أحدث وقت بين وقت الإضافة للهاتف ووقت التعديل ووقت الالتقاط لتظهر الصور الحديثة فوراً في الأعلى
+                        val timeMs = max(addedMs, max(modMs, takenMs)).let { if (it > 0L) it else nowMs }
+
                         val rawBucket = cursor.getString(bucketCol) ?: "الكاميرا"
                         val widthPx = if (wCol >= 0) cursor.getInt(wCol) else 0
                         val heightPx = if (hCol >= 0) cursor.getInt(hCol) else 0
@@ -810,8 +1252,9 @@ class MainActivity : Activity() {
                 val vidProjection = arrayOf(
                     MediaStore.Video.Media._ID,
                     MediaStore.Video.Media.DISPLAY_NAME,
-                    MediaStore.Video.Media.DATE_MODIFIED,
                     MediaStore.Video.Media.DATE_ADDED,
+                    MediaStore.Video.Media.DATE_MODIFIED,
+                    MediaStore.Video.Media.DATE_TAKEN,
                     MediaStore.Video.Media.BUCKET_DISPLAY_NAME,
                     MediaStore.Video.Media.DURATION,
                     MediaStore.Video.Media.WIDTH,
@@ -824,12 +1267,13 @@ class MainActivity : Activity() {
                     vidProjection,
                     null,
                     null,
-                    "${MediaStore.Video.Media.DATE_MODIFIED} DESC"
+                    "${MediaStore.Video.Media.DATE_ADDED} DESC, ${MediaStore.Video.Media._ID} DESC"
                 )?.use { cursor ->
                     val idCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
                     val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DISPLAY_NAME)
-                    val modCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DATE_MODIFIED)
                     val addCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DATE_ADDED)
+                    val modCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DATE_MODIFIED)
+                    val takenCol = cursor.getColumnIndex(MediaStore.Video.Media.DATE_TAKEN)
                     val bucketCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.BUCKET_DISPLAY_NAME)
                     val durCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DURATION)
                     val wCol = cursor.getColumnIndex(MediaStore.Video.Media.WIDTH)
@@ -842,8 +1286,12 @@ class MainActivity : Activity() {
                         val itemId = "vid_$id"
                         val rawName = cursor.getString(nameCol) ?: "فيديو_$id.mp4"
                         val displayName = customNamesMap[itemId] ?: rawName
-                        val rawSec = cursor.getLong(modCol).let { if (it > 0L) it else cursor.getLong(addCol) }
-                        val timeMs = if (rawSec > 100_000_000_000L) rawSec else rawSec * 1000L
+
+                        val addedMs = normalizeMediaTimestampMs(cursor.getLong(addCol), nowMs)
+                        val modMs = normalizeMediaTimestampMs(cursor.getLong(modCol), nowMs)
+                        val takenMs = if (takenCol >= 0) normalizeMediaTimestampMs(cursor.getLong(takenCol), nowMs) else 0L
+                        val timeMs = max(addedMs, max(modMs, takenMs)).let { if (it > 0L) it else nowMs }
+
                         val rawBucket = cursor.getString(bucketCol) ?: "الكاميرا"
                         val durMs = cursor.getLong(durCol)
                         val totalSec = (durMs / 1000L).coerceAtLeast(1L)
@@ -888,7 +1336,8 @@ class MainActivity : Activity() {
                     }
                 }
 
-                loaded.sortByDescending { it.timestampMs }
+                // ترتيب جميع الصور والفيديوهات تنازلياً حسب أحدث وقت ثم أحدث معرّف MediaStore
+                loaded.sortWith(compareByDescending<MediaItem> { it.timestampMs }.thenByDescending { it.mediaStoreId })
             } catch (_: Exception) {
             }
 
@@ -902,14 +1351,14 @@ class MainActivity : Activity() {
                     MediaStore.Audio.Media.ALBUM,
                     MediaStore.Audio.Media.DURATION,
                     MediaStore.Audio.Media.SIZE,
-                    MediaStore.Audio.Media.DATE_MODIFIED
+                    MediaStore.Audio.Media.DATE_ADDED
                 )
                 contentResolver.query(
                     MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
                     audProjection,
                     null,
                     null,
-                    "${MediaStore.Audio.Media.DATE_MODIFIED} DESC"
+                    "${MediaStore.Audio.Media.DATE_ADDED} DESC, ${MediaStore.Audio.Media._ID} DESC"
                 )?.use { cursor ->
                     val idCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
                     val titleCol = cursor.getColumnIndex(MediaStore.Audio.Media.TITLE)
@@ -958,19 +1407,31 @@ class MainActivity : Activity() {
             }
 
             handler.post {
-                val changed = (loaded.size != deviceMediaItems.size) ||
-                    (loaded.firstOrNull()?.id != deviceMediaItems.firstOrNull()?.id) ||
-                    (loadedAudio.size != deviceAudioTracks.size)
+                isLoadingMedia.set(false)
+                val prevTopId = deviceMediaItems.firstOrNull()?.id
+                val prevCount = deviceMediaItems.size
                 deviceMediaItems.clear()
                 deviceMediaItems.addAll(loaded)
                 deviceAudioTracks.clear()
                 deviceAudioTracks.addAll(loadedAudio)
+                if (loaded.isNotEmpty()) {
+                    migrateLegacyPermanentDeletes()
+                }
                 refreshCachedVisibleItems()
                 rebuildDynamicStoriesFromRealMedia()
-                if (changed || cachedVisibleItems.isEmpty()) {
-                    renderActiveScreen()
-                } else {
+
+                val newTopId = deviceMediaItems.firstOrNull()?.id
+                val hasChanged = (loaded.size != prevCount) || (newTopId != prevTopId)
+                if (activePicturesAdapter != null && currentTab == 0 && activeAlbumDetail == null && activeSubPageTitle == null && cachedVisibleItems.isNotEmpty()) {
                     activePicturesAdapter?.updateData(buildPictureListRows(cachedVisibleItems, picturesColumnCount))
+                } else if (hasChanged || cachedVisibleItems.isEmpty()) {
+                    renderActiveScreen()
+                }
+                if (loaded.isNotEmpty()) {
+                    purgeExpiredTrashItems()
+                }
+                if (reloadQueued.compareAndSet(true, false)) {
+                    loadDeviceMediaAsync()
                 }
             }
         }.start()
@@ -1137,6 +1598,7 @@ class MainActivity : Activity() {
     // ============================================================
     private fun enterSelectionModeFast(firstItemId: String? = null) {
         isSelectionMode = true
+        try { rootStack.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS) } catch (_: Exception) {}
         if (firstItemId != null) {
             selectedMediaIds.add(firstItemId)
         }
@@ -1234,7 +1696,7 @@ class MainActivity : Activity() {
             return
         }
 
-        // الترتيب المطابق لسامسونج: ☰ (أقصى اليسار) | القصص | ألبومات | الصور (أقصى اليمين)
+        // الترتيب المطابق لسامسونج:  (أقصى اليسار) | القصص | ألبومات | الصور (أقصى اليمين)
         val menuTab = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
@@ -1266,6 +1728,13 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
             isClickable = true
             setOnClickListener {
+                if (selected && tabIndex == 0 && !isSelectionMode) {
+                    val lv = activePicturesListView
+                    if (lv != null) {
+                        if (lv.firstVisiblePosition > 30) lv.setSelection(0) else lv.smoothScrollToPositionFromTop(0, 0, 320)
+                    }
+                    return@setOnClickListener
+                }
                 closeOverlay()
                 activeAlbumDetail = null
                 activeSubPageTitle = null
@@ -1307,6 +1776,7 @@ class MainActivity : Activity() {
     // ============================================================
     private fun renderActiveScreen() {
         activePicturesAdapter = null
+        activePicturesListView = null
         activeSelectionTitleTv = null
         activeSelectAllTv = null
         mainContentArea.removeAllViews()
@@ -1453,138 +1923,9 @@ class MainActivity : Activity() {
 
         wrapper.addView(normalTopBar, LinearLayout.LayoutParams(-1, -2))
 
-        // شريط الفلترة السريعة (الكل | الصور | مقاطع فيديو | المفضلة) بدون أي لاج
-        val filterScroll = HorizontalScrollView(this).apply {
-            isHorizontalScrollBarEnabled = false
-            visibility = if (isSelectionMode) View.GONE else View.VISIBLE
-        }
-        val filterRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(10), dp(2), dp(10), dp(8))
-            layoutDirection = View.LAYOUT_DIRECTION_RTL
-        }
-        val allItemsRaw = getVisibleMediaItems()
-        val vidCount = allItemsRaw.count { it.isVideo }
-        val imgCount = allItemsRaw.size - vidCount
-        val favCount = allItemsRaw.count { favoriteIds.contains(it.id) }
-
-        val filterDefs = listOf(
-            Pair("الكل (${toArabicDigits(allItemsRaw.size)})", 0),
-            Pair("الصور (${toArabicDigits(imgCount)})", 1),
-            Pair("فيديوهات (${toArabicDigits(vidCount)})", 2),
-            Pair("المفضلة (${toArabicDigits(favCount)})", 3),
-            Pair("🎵 الصوتيات (${toArabicDigits(deviceAudioTracks.size)})", 99)
-        )
-        for ((fText, fCode) in filterDefs) {
-            val active = (picturesQuickFilter == fCode)
-            val chip = TextView(this).apply {
-                text = fText
-                textSize = 12f
-                typeface = if (active) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
-                setTextColor(if (active) Color.WHITE else colorTextSecondary)
-                setPadding(dp(13), dp(6), dp(13), dp(6))
-                background = GradientDrawable().apply {
-                    setColor(if (active) colorSamsungBlue else colorCardDark)
-                    cornerRadius = dpF(16f)
-                    setStroke(dp(1), if (active) colorSamsungBlue else colorBorderSubtle)
-                }
-                setOnClickListener {
-                    if (fCode == 99) {
-                        showProAudioPlayerOverlay()
-                    } else if (picturesQuickFilter != fCode) {
-                        picturesQuickFilter = fCode
-                        val filteredNow = when (picturesQuickFilter) {
-                            1 -> allItemsRaw.filter { !it.isVideo }
-                            2 -> allItemsRaw.filter { it.isVideo }
-                            3 -> allItemsRaw.filter { favoriteIds.contains(it.id) }
-                            else -> allItemsRaw
-                        }
-                        activePicturesAdapter?.updateData(buildPictureListRows(filteredNow, picturesColumnCount))
-                        renderActiveScreen()
-                    }
-                }
-            }
-            filterRow.addView(
-                chip,
-                LinearLayout.LayoutParams(-2, -2).apply { setMargins(dp(4), 0, dp(4), 0) }
-            )
-        }
-        filterScroll.addView(filterRow)
-        wrapper.addView(filterScroll, LinearLayout.LayoutParams(-1, -2))
-
-        // شريط وضع التحديد العلوي
-        val selectionTopBar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(12), dp(14), dp(16), dp(8))
-            layoutDirection = View.LAYOUT_DIRECTION_LTR
-            visibility = if (isSelectionMode) View.VISIBLE else View.GONE
-        }
-
-        val cancelBtn = TextView(this).apply {
-            text = "إلغاء"
-            textSize = 15f
-            setTextColor(colorWhite)
-            setPadding(dp(10), dp(6), dp(10), dp(6))
-            setOnClickListener {
-                selectionTopBar.visibility = View.GONE
-                normalTopBar.visibility = View.VISIBLE
-                exitSelectionModeFast()
-            }
-        }
-        selectionTopBar.addView(cancelBtn)
-
-        val selectAllTv = TextView(this).apply {
-            text = "الكل"
-            textSize = 14f
-            setTextColor(colorSamsungBlue)
-            typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(12), dp(6), dp(12), dp(6))
-            setOnClickListener {
-                val allVisible = getVisibleMediaItems()
-                if (selectedMediaIds.size >= allVisible.size && allVisible.isNotEmpty()) {
-                    selectedMediaIds.clear()
-                } else {
-                    selectedMediaIds.addAll(allVisible.map { it.id })
-                }
-                updateSelectionTopBarAndListInPlace()
-            }
-        }
-        activeSelectAllTv = selectAllTv
-        selectionTopBar.addView(selectAllTv)
-
-        val countTv = TextView(this).apply {
-            text = if (selectedMediaIds.isEmpty()) "تحديد عناصر"
-            else "تم تحديد ${toArabicDigits(selectedMediaIds.size)}"
-            textSize = 17f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(colorWhite)
-            gravity = Gravity.RIGHT or Gravity.CENTER_VERTICAL
-        }
-        activeSelectionTitleTv = countTv
-        selectionTopBar.addView(countTv, LinearLayout.LayoutParams(0, -2, 1f))
-        wrapper.addView(selectionTopBar, LinearLayout.LayoutParams(-1, -2))
-
-        val rawVisible = getVisibleMediaItems()
-        if (rawVisible.isEmpty()) {
-            wrapper.addView(buildEmptyOrPermissionPromptView(), LinearLayout.LayoutParams(-1, 0, 1f))
-            return wrapper
-        }
-        val visibleItems = when (picturesQuickFilter) {
-            1 -> rawVisible.filter { !it.isVideo }
-            2 -> rawVisible.filter { it.isVideo }
-            3 -> rawVisible.filter { favoriteIds.contains(it.id) }
-            else -> rawVisible
-        }
+        val visibleItems = getVisibleMediaItems()
         if (visibleItems.isEmpty()) {
-            val emptyFilterTv = TextView(this).apply {
-                text = "لا توجد عناصر في هذا التصنيف حالياً"
-                textSize = 15f
-                setTextColor(colorTextMuted)
-                gravity = Gravity.CENTER
-            }
-            wrapper.addView(emptyFilterTv, LinearLayout.LayoutParams(-1, 0, 1f))
+            wrapper.addView(buildEmptyOrPermissionPromptView(), LinearLayout.LayoutParams(-1, 0, 1f))
             return wrapper
         }
 
@@ -1604,7 +1945,13 @@ class MainActivity : Activity() {
 
         val listView = object : ListView(this) {
             override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+                if (ev.pointerCount > 1) {
+                    isMultiTouchPinching = true
+                }
                 gridScaleDetector.onTouchEvent(ev)
+                if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) {
+                    handler.postDelayed({ isMultiTouchPinching = false }, 120L)
+                }
                 return super.dispatchTouchEvent(ev)
             }
         }.apply {
@@ -1613,10 +1960,12 @@ class MainActivity : Activity() {
             dividerHeight = 0
             selector = ColorDrawable(Color.TRANSPARENT)
             isFastScrollEnabled = true
+            verticalScrollbarPosition = View.SCROLLBAR_POSITION_RIGHT
             setPadding(dp(4), 0, dp(4), dp(24))
             clipToPadding = false
         }
 
+        activePicturesListView = listView
         wrapper.addView(listView, LinearLayout.LayoutParams(-1, 0, 1f))
         return wrapper
     }
@@ -1631,7 +1980,7 @@ class MainActivity : Activity() {
         private val contextList: List<MediaItem>,
         private val isRecycleBinMode: Boolean,
         private val onEnterSelection: (String) -> Unit
-    ) : BaseAdapter() {
+    ) : BaseAdapter(), SectionIndexer {
 
         val totalMediaCount: Int
             get() = contextList.size
@@ -1639,8 +1988,42 @@ class MainActivity : Activity() {
         private val spacing = dp(2)
         private val cellSize = (resources.displayMetrics.widthPixels - dp(8) - spacing * (cols * 2)) / cols
 
+        private var sectionTitles: Array<Any> = arrayOf()
+        private var sectionStarts: IntArray = IntArray(0)
+        private var sectionOfRow: IntArray = IntArray(0)
+
+        private fun rebuildSections() {
+            val titles = ArrayList<Any>()
+            val starts = ArrayList<Int>()
+            val ofRow = IntArray(rows.size)
+            var cur = -1
+            for (i in rows.indices) {
+                val r = rows[i]
+                if (r is PictureListRow.DateHeader) {
+                    titles.add(r.dateTitle)
+                    starts.add(i)
+                    cur++
+                }
+                ofRow[i] = if (cur < 0) 0 else cur
+            }
+            sectionTitles = titles.toTypedArray()
+            sectionStarts = starts.toIntArray()
+            sectionOfRow = ofRow
+        }
+
+        init {
+            rebuildSections()
+        }
+
+        override fun getSections(): Array<Any> = sectionTitles
+        override fun getPositionForSection(sectionIndex: Int): Int =
+            if (sectionStarts.isEmpty()) 0 else sectionStarts[sectionIndex.coerceIn(0, sectionStarts.size - 1)]
+        override fun getSectionForPosition(position: Int): Int =
+            if (sectionOfRow.isEmpty()) 0 else sectionOfRow[position.coerceIn(0, sectionOfRow.size - 1)]
+
         fun updateData(newRows: List<PictureListRow>) {
             rows = newRows
+            rebuildSections()
             notifyDataSetChanged()
         }
 
@@ -1748,6 +2131,14 @@ class MainActivity : Activity() {
                 if (i < items.size) {
                     val media = items[i]
                     cell.visibility = View.VISIBLE
+                    cell.setOnTouchListener { v, ev ->
+                        when (ev.actionMasked) {
+                            MotionEvent.ACTION_DOWN -> v.animate().scaleX(0.95f).scaleY(0.95f).setDuration(90L).start()
+                            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
+                                v.animate().scaleX(1f).scaleY(1f).setDuration(150L).start()
+                        }
+                        false
+                    }
                     cell.bind(
                         media = media,
                         cellPx = cellSize,
@@ -1757,6 +2148,7 @@ class MainActivity : Activity() {
                         trashDaysLeft = if (isRecycleBinMode) getRemainingTrashDays(media.id) else 0
                     )
                     cell.setOnClickListener {
+                        if (isMultiTouchPinching) return@setOnClickListener
                         if (isRecycleBinMode) {
                             showTrashItemActionDialog(media)
                         } else if (isSelectionMode) {
@@ -1771,6 +2163,7 @@ class MainActivity : Activity() {
                         }
                     }
                     cell.setOnLongClickListener {
+                        if (isMultiTouchPinching) return@setOnLongClickListener true
                         if (!isRecycleBinMode) {
                             onEnterSelection(media.id)
                         }
@@ -1877,7 +2270,7 @@ class MainActivity : Activity() {
 
             // شارة الفيديو ومدته أسفل اليسار
             if (media.isVideo) {
-                val label = if (media.durationText.isNotEmpty()) "▶ ${media.durationText}" else "▶"
+                val label = if (media.durationText.isNotEmpty()) "${media.durationText}" else "تشغيل"
                 textPaint.textSize = dpF(10f)
                 val tw = textPaint.measureText(label)
                 val padH = dpF(6f)
@@ -2012,7 +2405,18 @@ class MainActivity : Activity() {
             layoutDirection = View.LAYOUT_DIRECTION_LTR
         }
 
-        val scroll = ScrollView(this).apply {
+        val scroll = object : ScrollView(this) {
+            override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+                if (ev.pointerCount > 1) {
+                    isMultiTouchPinching = true
+                }
+                albumsScaleDetector.onTouchEvent(ev)
+                if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) {
+                    handler.postDelayed({ isMultiTouchPinching = false }, 120L)
+                }
+                return super.dispatchTouchEvent(ev)
+            }
+        }.apply {
             isVerticalScrollBarEnabled = false
         }
 
@@ -2096,6 +2500,219 @@ class MainActivity : Activity() {
         }
 
         mainCol.addView(actionRow, LinearLayout.LayoutParams(-1, -2))
+
+        // ============================================================
+        // ويدجات الوسائط التفاعلية الاحترافية (ويدجت مشغل الموسيقى + ويدجت مشغل الفيديو والأفلام)
+        // ============================================================
+        val widgetsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+        }
+
+        // 1. ويدجت مشغل الموسيقى الاحترافي
+        val musicWidgetCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+            isClickable = true
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TL_BR,
+                intArrayOf(0xFF0A2A4E.toInt(), 0xFF141822.toInt())
+            ).apply {
+                cornerRadius = dpF(22f)
+                setStroke(dp(1), 0x448CD0FA)
+            }
+            setOnClickListener { showProAudioPlayerOverlay() }
+        }
+
+        val mwTop = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+        }
+        val mwIconWrap = FrameLayout(this).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(0x330A78D6)
+            }
+        }
+        mwIconWrap.addView(
+            SamsungIconView(this, SamsungIconView.IconType.AUDIO_WAVE, colorBrandIceBlue, 2.0f),
+            FrameLayout.LayoutParams(dp(18), dp(18)).apply { gravity = Gravity.CENTER }
+        )
+        mwTop.addView(mwIconWrap, LinearLayout.LayoutParams(dp(32), dp(32)))
+
+        val mwTag = TextView(this).apply {
+            text = "مشغل الموسيقى"
+            textSize = 12.5f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(colorBrandIceBlue)
+            setPadding(0, 0, dp(8), 0)
+        }
+        mwTop.addView(mwTag)
+        musicWidgetCard.addView(mwTop, LinearLayout.LayoutParams(-1, -2))
+
+        val activeSong = deviceAudioTracks.getOrNull(currentAudioIndex) ?: deviceAudioTracks.firstOrNull()
+        val mwSongTitle = TextView(this).apply {
+            text = activeSong?.title ?: "مكتبة الصوتيات"
+            textSize = 13.5f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+            gravity = Gravity.RIGHT
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        musicWidgetCard.addView(mwSongTitle, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+
+        val mwSongSub = TextView(this).apply {
+            text = if (activeSong != null) "${activeSong.artist} • ${toArabicDigits(deviceAudioTracks.size)} مقطع"
+            else "${toArabicDigits(deviceAudioTracks.size)} ملف صوتي"
+            textSize = 11f
+            setTextColor(0xFFB0C4DE.toInt())
+            gravity = Gravity.RIGHT
+            maxLines = 1
+        }
+        musicWidgetCard.addView(mwSongSub, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(2) })
+
+        val mwControls = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(0, dp(10), 0, 0)
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+        val mwPrev = makeCircleIconBtn(SamsungIconView.IconType.SKIP_PREV, 28, 14, 0x22FFFFFF) {
+            if (deviceAudioTracks.isNotEmpty()) {
+                playAudioTrackAtIndex(if (currentAudioIndex <= 0) deviceAudioTracks.size - 1 else currentAudioIndex - 1)
+                renderActiveScreen()
+            }
+        }
+        val mwPlayIcon = if (audioPlayer?.isPlaying == true) SamsungIconView.IconType.PAUSE_SOLID else SamsungIconView.IconType.PLAY_SOLID
+        val mwPlay = makeCircleIconBtn(mwPlayIcon, 34, 16, colorSamsungBlue) {
+            if (deviceAudioTracks.isEmpty()) {
+                showProAudioPlayerOverlay()
+            } else if (currentAudioIndex < 0) {
+                playAudioTrackAtIndex(0)
+                renderActiveScreen()
+            } else {
+                audioPlayer?.let { mp ->
+                    if (mp.isPlaying) mp.pause() else mp.start()
+                }
+                updateMiniAudioPlayerBar()
+                renderActiveScreen()
+            }
+        }
+        val mwNext = makeCircleIconBtn(SamsungIconView.IconType.SKIP_NEXT, 28, 14, 0x22FFFFFF) {
+            if (deviceAudioTracks.isNotEmpty()) {
+                playAudioTrackAtIndex(currentAudioIndex + 1)
+                renderActiveScreen()
+            }
+        }
+        mwControls.addView(mwPrev, LinearLayout.LayoutParams(dp(28), dp(28)).apply { rightMargin = dp(8) })
+        mwControls.addView(mwPlay, LinearLayout.LayoutParams(dp(34), dp(34)))
+        mwControls.addView(mwNext, LinearLayout.LayoutParams(dp(28), dp(28)).apply { leftMargin = dp(8) })
+        musicWidgetCard.addView(mwControls, LinearLayout.LayoutParams(-1, -2))
+
+        // 2. ويدجت مشغل الفيديو والأفلام (Cinema Video Widget)
+        val allVideos = getVisibleMediaItems().filter { it.isVideo }
+        val latestVid = allVideos.firstOrNull()
+        val videoWidgetCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+            isClickable = true
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TL_BR,
+                intArrayOf(0xFF1E1A34.toInt(), 0xFF14161E.toInt())
+            ).apply {
+                cornerRadius = dpF(22f)
+                setStroke(dp(1), 0x448CD0FA)
+            }
+            setOnClickListener {
+                if (latestVid != null) {
+                    openFullCinemaVideoPlayer(latestVid, allVideos)
+                } else {
+                    openSubPage("مقاطع فيديو", allVideos)
+                }
+            }
+        }
+
+        val vwTop = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+        }
+        val vwIconWrap = FrameLayout(this).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(0x333E82F7)
+            }
+        }
+        vwIconWrap.addView(
+            SamsungIconView(this, SamsungIconView.IconType.VIDEO_PLAY, colorBrandIceBlue, 2.0f),
+            FrameLayout.LayoutParams(dp(18), dp(18)).apply { gravity = Gravity.CENTER }
+        )
+        vwTop.addView(vwIconWrap, LinearLayout.LayoutParams(dp(32), dp(32)))
+
+        val vwTag = TextView(this).apply {
+            text = "سينما الفيديوهات"
+            textSize = 12.5f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(colorBrandIceBlue)
+            setPadding(0, 0, dp(8), 0)
+        }
+        vwTop.addView(vwTag)
+        videoWidgetCard.addView(vwTop, LinearLayout.LayoutParams(-1, -2))
+
+        val vwTitle = TextView(this).apply {
+            text = latestVid?.title ?: "مشغل الأفلام والفيديو"
+            textSize = 13.5f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+            gravity = Gravity.RIGHT
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        videoWidgetCard.addView(vwTitle, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+
+        val vwSub = TextView(this).apply {
+            text = "${toArabicDigits(allVideos.size)} فيديو جاهز للتشغيل"
+            textSize = 11f
+            setTextColor(0xFFB0C4DE.toInt())
+            gravity = Gravity.RIGHT
+            maxLines = 1
+        }
+        videoWidgetCard.addView(vwSub, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(2) })
+
+        val vwBtnRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(0, dp(10), 0, 0)
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+        val openListBtn = makeCircleIconBtn(SamsungIconView.IconType.HAMBURGER, 28, 14, 0x22FFFFFF) {
+            openSubPage("مقاطع فيديو", allVideos)
+        }
+        val playVidBtn = makeCircleIconBtn(SamsungIconView.IconType.PLAY_SOLID, 34, 16, colorSamsungBlue) {
+            if (latestVid != null) {
+                openFullCinemaVideoPlayer(latestVid, allVideos)
+            } else {
+                openSubPage("مقاطع فيديو", allVideos)
+            }
+        }
+        val pipVidBtn = makeCircleIconBtn(SamsungIconView.IconType.PIP_WINDOW, 28, 14, 0x22FFFFFF) {
+            if (latestVid != null) {
+                startFloatingPipVideoWidget(latestVid, 0)
+            }
+        }
+        vwBtnRow.addView(openListBtn, LinearLayout.LayoutParams(dp(28), dp(28)).apply { rightMargin = dp(8) })
+        vwBtnRow.addView(playVidBtn, LinearLayout.LayoutParams(dp(34), dp(34)))
+        vwBtnRow.addView(pipVidBtn, LinearLayout.LayoutParams(dp(28), dp(28)).apply { leftMargin = dp(8) })
+        videoWidgetCard.addView(vwBtnRow, LinearLayout.LayoutParams(-1, -2))
+
+        widgetsRow.addView(musicWidgetCard, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(6) })
+        widgetsRow.addView(videoWidgetCard, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(6) })
+        mainCol.addView(
+            widgetsRow,
+            LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(16) }
+        )
 
         if (showCustomizeAlbumsBanner) {
             val bannerCard = LinearLayout(this).apply {
@@ -2226,38 +2843,36 @@ class MainActivity : Activity() {
             allAlbums
         }
 
+        val cols = albumsColumnCount.coerceIn(2, 4)
         val availWidth = resources.displayMetrics.widthPixels - dp(24)
-        val colGap = dp(14)
-        val cardSize = (availWidth - colGap) / 2
+        val colGap = if (cols >= 3) dp(10) else dp(14)
+        val cardSize = (availWidth - colGap * (cols - 1)) / cols
 
-        val albumRows = albumsToShow.chunked(2)
-        for (pair in albumRows) {
+        val albumRows = albumsToShow.chunked(cols)
+        for (rowAlbums in albumRows) {
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 layoutDirection = View.LAYOUT_DIRECTION_RTL
             }
 
-            val rightAlbum = pair[0]
-            row.addView(
-                buildAlbumCardView(rightAlbum, cardSize),
-                LinearLayout.LayoutParams(cardSize, -2)
-            )
-
-            row.addView(View(this), LinearLayout.LayoutParams(colGap, 1))
-
-            if (pair.size > 1) {
-                val leftAlbum = pair[1]
-                row.addView(
-                    buildAlbumCardView(leftAlbum, cardSize),
-                    LinearLayout.LayoutParams(cardSize, -2)
-                )
-            } else {
-                row.addView(View(this), LinearLayout.LayoutParams(cardSize, 1))
+            for (c in 0 until cols) {
+                if (c > 0) {
+                    row.addView(View(this), LinearLayout.LayoutParams(colGap, 1))
+                }
+                if (c < rowAlbums.size) {
+                    val alb = rowAlbums[c]
+                    row.addView(
+                        buildAlbumCardView(alb, cardSize),
+                        LinearLayout.LayoutParams(cardSize, -2)
+                    )
+                } else {
+                    row.addView(View(this), LinearLayout.LayoutParams(cardSize, 1))
+                }
             }
 
             mainCol.addView(
                 row,
-                LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(18) }
+                LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(16) }
             )
         }
 
@@ -2306,6 +2921,7 @@ class MainActivity : Activity() {
             layoutDirection = View.LAYOUT_DIRECTION_LTR
             isClickable = true
             setOnClickListener {
+                if (isMultiTouchPinching) return@setOnClickListener
                 if (isAlbumSelectionMode) {
                     if (selectedAlbumIds.contains(album.id)) {
                         selectedAlbumIds.remove(album.id)
@@ -2329,13 +2945,10 @@ class MainActivity : Activity() {
 
         val thumbFrame = FrameLayout(this)
 
+        val radiusCorner = if (albumsColumnCount >= 3) dpF(18f) else dpF(22f)
         when {
-            album.isRecentSpecial && album.items.isNotEmpty() -> {
-                val miniGrid = RecentMiniGridView(this, album.items.take(9), dpF(22f))
-                thumbFrame.addView(miniGrid, FrameLayout.LayoutParams(-1, -1))
-            }
             album.items.isEmpty() -> {
-                val emptyCard = EmptyFavoritesCardView(this, dpF(22f))
+                val emptyCard = EmptyFavoritesCardView(this, radiusCorner)
                 thumbFrame.addView(emptyCard, FrameLayout.LayoutParams(-1, -1))
             }
             else -> {
@@ -2343,7 +2956,7 @@ class MainActivity : Activity() {
                 val coverView = AsyncMediaThumbnailView(
                     context = this,
                     media = coverItem,
-                    cornerRadiusPx = dpF(22f),
+                    cornerRadiusPx = radiusCorner,
                     strokeColor = colorBorderSubtle,
                     preferredDecodePx = cardSizePx
                 )
@@ -2443,6 +3056,15 @@ class MainActivity : Activity() {
                 isAlbumSelectionMode = true
                 selectedAlbumIds.clear()
                 selectedAlbumIds.addAll(buildAlbumsList().map { it.id })
+                renderActiveScreen()
+            },
+            MenuOption("تغيير حجم الشبكة (${toArabicDigits(albumsColumnCount)} أعمدة)") {
+                albumsColumnCount = when (albumsColumnCount) {
+                    2 -> 3
+                    3 -> 4
+                    else -> 2
+                }
+                savePersistedState()
                 renderActiveScreen()
             },
             MenuOption("تحديد الألبومات الأساسية") {
@@ -2723,7 +3345,7 @@ class MainActivity : Activity() {
     }
 
     // ============================================================
-    // 4. النافذة السفلية المنبثقة (☰ Hamburger Menu)
+    // 4. النافذة السفلية المنبثقة ( Hamburger Menu)
     // ============================================================
     private fun showHamburgerBottomPopup() {
         overlayLayer.removeAllViews()
@@ -2919,6 +3541,9 @@ class MainActivity : Activity() {
     }
 
     private fun closeOverlay() {
+        if (requestedOrientation != ActivityInfo.SCREEN_ORIENTATION_PORTRAIT) {
+            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        }
         overlayLayer.removeAllViews()
         overlayLayer.visibility = View.GONE
     }
@@ -2990,12 +3615,7 @@ class MainActivity : Activity() {
                         .setTitle("إفراغ سلة المحذوفات")
                         .setMessage("هل تريد حذف جميع العناصر (${toArabicDigits(items.size)}) نهائياً؟")
                         .setPositiveButton("إفراغ السلة") { _, _ ->
-                            for (itItem in items) {
-                                permanentlyDeleteItem(itItem.id)
-                            }
-                            savePersistedState()
-                            openRecycleBinSubPage()
-                            Toast.makeText(this@MainActivity, "تم إفراغ سلة المحذوفات نهائياً", Toast.LENGTH_SHORT).show()
+                            permanentlyDeleteItems(items.map { it.id })
                         }
                         .setNegativeButton("إلغاء", null)
                         .show()
@@ -3109,6 +3729,7 @@ class MainActivity : Activity() {
             dividerHeight = 0
             selector = ColorDrawable(Color.TRANSPARENT)
             isFastScrollEnabled = true
+            verticalScrollbarPosition = View.SCROLLBAR_POSITION_RIGHT
             setPadding(dp(4), dp(4), dp(4), dp(24))
             clipToPadding = false
         }
@@ -3131,9 +3752,6 @@ class MainActivity : Activity() {
             }
             .setNeutralButton("حذف نهائي") { _, _ ->
                 permanentlyDeleteItem(media.id)
-                savePersistedState()
-                openRecycleBinSubPage()
-                Toast.makeText(this, "تم الحذف نهائياً", Toast.LENGTH_SHORT).show()
             }
             .setNegativeButton("إلغاء", null)
             .show()
@@ -3158,6 +3776,11 @@ class MainActivity : Activity() {
     // عارض الصور والفيديو الفوري فائق الدقة (Instant Full-Res Viewer)
     // يحدث الصورة والبيانات في نفس اللحظة بدون إعادة بناء الشاشة!
     // ============================================================
+    // ============================================================
+    // عارض الصور والفيديو المطابق لسامسونج (1000036338.png)
+    // يحتوي على الشريط السفلي ذو الـ 5 أيقونات (حذف | مشاركة | تفاصيل i | تعديل | المفضلة)
+    // وزر "تشغيل الفيديو" مع زر كتم الصوت الدائري على اليسار
+    // ============================================================
     private fun showFullScreenPhotoViewer(
         initialMedia: MediaItem,
         sourceList: List<MediaItem> = getVisibleMediaItems()
@@ -3165,6 +3788,7 @@ class MainActivity : Activity() {
         val list = sourceList.ifEmpty { listOf(initialMedia) }
         var currentIndex = list.indexOfFirst { it.id == initialMedia.id }.coerceAtLeast(0)
         var barsVisible = true
+        var previewMuted = true
 
         overlayLayer.removeAllViews()
         overlayLayer.visibility = View.VISIBLE
@@ -3178,34 +3802,28 @@ class MainActivity : Activity() {
         val centerContainer = FrameLayout(this)
         root.addView(centerContainer, FrameLayout.LayoutParams(-1, -1))
 
+        // الشريط العلوي المطابق للصورة 1000036338.png:
+        // أقصى اليسار: [ ⋮ ] ثم [ أيقونة تدوير الشاشة ]  <--->  أقصى اليمين: [ › رجوع ]
         val topBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(12), dp(14), dp(14), dp(12))
-            setBackgroundColor(0xBB000000.toInt())
+            setBackgroundColor(0x88000000.toInt())
             layoutDirection = View.LAYOUT_DIRECTION_LTR
-        }
-
-        val nameTv = TextView(this).apply {
-            textSize = 15f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Color.WHITE)
-            gravity = Gravity.RIGHT
-            maxLines = 1
-            ellipsize = TextUtils.TruncateAt.END
-        }
-        val subTv = TextView(this).apply {
-            textSize = 11.5f
-            setTextColor(0xFFCCCCCC.toInt())
-            gravity = Gravity.RIGHT
         }
 
         val bottomBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(12), dp(10), dp(12), dp(12))
-            setBackgroundColor(0xDD000000.toInt())
+            setPadding(dp(8), dp(8), dp(8), dp(12))
+            setBackgroundColor(0xCC000000.toInt())
             layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+
+        // شريط معاينة الفيديو العائم فوق الشريط السفلي (زر كتم الصوت على اليسار + كبسولة "تشغيل الفيديو" في الوسط كما في 1000036338.png)
+        val videoPreviewActionRow = FrameLayout(this).apply {
+            visibility = View.GONE
+            setPadding(dp(18), dp(6), dp(18), dp(6))
         }
 
         lateinit var bindCurrentMediaToViewer: () -> Unit
@@ -3215,111 +3833,126 @@ class MainActivity : Activity() {
             val vis = if (barsVisible) View.VISIBLE else View.GONE
             topBar.visibility = vis
             bottomBar.visibility = vis
+            if (list[currentIndex].isVideo) {
+                videoPreviewActionRow.visibility = vis
+            }
         }
 
         val zoomView = TouchZoomableImageView(
             context = this,
-            initialMedia = list[currentIndex],
+            mediaList = list,
+            initialIndex = currentIndex,
             onSingleTap = { toggleBarsVisibility() },
-            onSwipeNext = {
-                if (currentIndex < list.size - 1) {
-                    currentIndex++
-                    bindCurrentMediaToViewer()
-                    centerContainer.translationX = dpF(36f)
-                    centerContainer.alpha = 0.7f
-                    centerContainer.animate()
-                        .translationX(0f)
-                        .alpha(1f)
-                        .setDuration(130L)
-                        .setInterpolator(smoothInterpolator)
-                        .start()
-                }
+            onIndexCommitted = { newIdx ->
+                currentIndex = newIdx
+                bindCurrentMediaToViewer()
             },
-            onSwipePrev = {
-                if (currentIndex > 0) {
-                    currentIndex--
-                    bindCurrentMediaToViewer()
-                    centerContainer.translationX = -dpF(36f)
-                    centerContainer.alpha = 0.7f
-                    centerContainer.animate()
-                        .translationX(0f)
-                        .alpha(1f)
-                        .setDuration(130L)
-                        .setInterpolator(smoothInterpolator)
-                        .start()
-                }
-            },
-            onSwipeUpDetails = { showMediaDetailsSheet(list[currentIndex]) }
+            onSwipeUpDetails = { showMediaDetailsSheet(list[currentIndex]) },
+            onDismissRequest = { closeOverlay() }
         )
-
-        val videoContainer = FrameLayout(this).apply {
-            visibility = View.GONE
-        }
-
-        val playVideoOverlayBtn = FrameLayout(this).apply {
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(0xBB000000.toInt())
-                setStroke(dp(2), Color.WHITE)
-            }
-            visibility = View.GONE
-        }
-        val playIcon = SamsungIconView(this, SamsungIconView.IconType.VIDEO_PLAY, Color.WHITE, 2.2f)
-        playVideoOverlayBtn.addView(
-            playIcon,
-            FrameLayout.LayoutParams(dp(34), dp(34)).apply { gravity = Gravity.CENTER }
-        )
-
         centerContainer.addView(zoomView, FrameLayout.LayoutParams(-1, -1))
-        centerContainer.addView(videoContainer, FrameLayout.LayoutParams(-1, -1))
-        centerContainer.addView(
-            playVideoOverlayBtn,
-            FrameLayout.LayoutParams(dp(74), dp(74)).apply { gravity = Gravity.CENTER }
-        )
 
-        // أزرار الشريط العلوي
+        // بناء عناصر الشريط العلوي (1000036338.png)
         val moreViewerBtn = makeTopIconButton(SamsungIconView.IconType.MORE_VERT, Color.WHITE) {
             showViewerMoreMenu(list[currentIndex]) { bindCurrentMediaToViewer() }
         }
-        topBar.addView(moreViewerBtn, LinearLayout.LayoutParams(dp(38), dp(38)))
+        topBar.addView(moreViewerBtn, LinearLayout.LayoutParams(dp(40), dp(40)))
 
-        val infoBtn = TextView(this).apply {
-            text = "ⓘ"
-            textSize = 20f
-            setTextColor(Color.WHITE)
-            setPadding(dp(10), dp(4), dp(10), dp(4))
-            setOnClickListener { showMediaDetailsSheet(list[currentIndex]) }
-        }
-        topBar.addView(infoBtn)
-
-        val titleCol = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.RIGHT
-        }
-        titleCol.addView(nameTv)
-        titleCol.addView(subTv)
-        topBar.addView(titleCol, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(10) })
-
-        val closeBtn = TextView(this).apply {
-            text = "›"
-            textSize = 28f
-            setTextColor(Color.WHITE)
-            setPadding(dp(10), 0, dp(6), 0)
-            setOnClickListener {
-                videoContainer.removeAllViews()
-                closeOverlay()
-                updateSelectionTopBarAndListInPlace()
+        val rotateScreenBtn = makeTopIconButton(SamsungIconView.IconType.ROTATE_PHONE, Color.WHITE) {
+            requestedOrientation = if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) {
+                ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            } else {
+                ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
             }
         }
-        topBar.addView(closeBtn)
+        topBar.addView(
+            rotateScreenBtn,
+            LinearLayout.LayoutParams(dp(40), dp(40)).apply { leftMargin = dp(4) }
+        )
+
+        topBar.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+
+        val backArrowBtn = makeTopIconButton(SamsungIconView.IconType.CHEVRON_RIGHT, Color.WHITE) {
+            closeOverlay()
+            updateSelectionTopBarAndListInPlace()
+        }
+        topBar.addView(backArrowBtn, LinearLayout.LayoutParams(dp(40), dp(40)))
 
         root.addView(
             topBar,
             FrameLayout.LayoutParams(-1, -2).apply { gravity = Gravity.TOP }
         )
 
-        // أزرار الشريط السفلي
-        val delBtn = makeViewerActionItem("حذف", SamsungIconView.IconType.TRASH, Color.WHITE) {
+        // بناء عناصر videoPreviewActionRow (1000036338.png)
+        val mutePreviewCircle = FrameLayout(this).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(0x991C1C1E.toInt())
+                setStroke(dp(1), 0x44FFFFFF)
+            }
+        }
+        val mutePreviewIcon = SamsungIconView(this, SamsungIconView.IconType.SPEAKER_MUTE, Color.WHITE, 1.8f)
+        mutePreviewCircle.addView(
+            mutePreviewIcon,
+            FrameLayout.LayoutParams(dp(18), dp(18)).apply { gravity = Gravity.CENTER }
+        )
+        mutePreviewCircle.setOnClickListener {
+            previewMuted = !previewMuted
+            mutePreviewCircle.removeAllViews()
+            mutePreviewCircle.addView(
+                SamsungIconView(
+                    this,
+                    if (previewMuted) SamsungIconView.IconType.SPEAKER_MUTE else SamsungIconView.IconType.SPEAKER_ON,
+                    Color.WHITE,
+                    1.8f
+                ),
+                FrameLayout.LayoutParams(dp(18), dp(18)).apply { gravity = Gravity.CENTER }
+            )
+        }
+        videoPreviewActionRow.addView(
+            mutePreviewCircle,
+            FrameLayout.LayoutParams(dp(38), dp(38)).apply { gravity = Gravity.LEFT or Gravity.CENTER_VERTICAL }
+        )
+
+        val playVideoPill = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(dp(18), dp(9), dp(18), dp(9))
+            background = GradientDrawable().apply {
+                setColor(0xAA18181C.toInt())
+                cornerRadius = dpF(22f)
+                setStroke(dp(1), 0x55FFFFFF)
+            }
+            setOnClickListener {
+                openFullCinemaVideoPlayer(list[currentIndex], list.filter { it.isVideo }.ifEmpty { list })
+            }
+        }
+        val playPillTv = TextView(this).apply {
+            text = "تشغيل الفيديو"
+            textSize = 13.5f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+            setPadding(0, 0, dp(8), 0)
+        }
+        val playPillIcon = SamsungIconView(this, SamsungIconView.IconType.PLAY_SOLID, Color.WHITE, 1.8f)
+        playVideoPill.addView(playPillTv)
+        playVideoPill.addView(playPillIcon, LinearLayout.LayoutParams(dp(14), dp(14)))
+        videoPreviewActionRow.addView(
+            playVideoPill,
+            FrameLayout.LayoutParams(-2, -2).apply { gravity = Gravity.CENTER }
+        )
+
+        root.addView(
+            videoPreviewActionRow,
+            FrameLayout.LayoutParams(-1, -2).apply {
+                gravity = Gravity.BOTTOM
+                bottomMargin = dp(66)
+            }
+        )
+
+        // الشريط السفلي ذو الـ 5 أيقونات فقط بدون نص (كما في 1000036338.png):
+        // من اليسار لليمين: [ سلة المحذوفات ] [ مشاركة ] [ تفاصيل (i) ] [ القلم (تعديل) ] [ المفضلة (قلب) ]
+        val delBtn = makeViewerIconOnlyButton(SamsungIconView.IconType.TRASH, Color.WHITE) {
             val curr = list[currentIndex]
             moveItemToTrash(curr.id)
             savePersistedState()
@@ -3328,273 +3961,304 @@ class MainActivity : Activity() {
                 "تم النقل إلى سلة المحذوفات (تبقى لمدة ٣٠ يوماً)",
                 Toast.LENGTH_SHORT
             ).show()
-            videoContainer.removeAllViews()
             closeOverlay()
             renderActiveScreen()
         }
-        bottomBar.addView(delBtn, LinearLayout.LayoutParams(0, -2, 1f))
+        bottomBar.addView(delBtn, LinearLayout.LayoutParams(0, dp(48), 1f))
 
-        val shareBtn = makeViewerActionItem("مشاركة", SamsungIconView.IconType.SHARE, Color.WHITE) {
+        val shareBtn = makeViewerIconOnlyButton(SamsungIconView.IconType.SHARE, Color.WHITE) {
             shareMediaItem(list[currentIndex])
         }
-        bottomBar.addView(shareBtn, LinearLayout.LayoutParams(0, -2, 1f))
+        bottomBar.addView(shareBtn, LinearLayout.LayoutParams(0, dp(48), 1f))
 
-        val editBtn = makeViewerActionItem("تعديل", SamsungIconView.IconType.EDIT_PEN, Color.WHITE) {
+        val infoCenterBtn = makeViewerIconOnlyButton(SamsungIconView.IconType.INFO_CIRCLE, Color.WHITE) {
+            showMediaDetailsSheet(list[currentIndex])
+        }
+        bottomBar.addView(infoCenterBtn, LinearLayout.LayoutParams(0, dp(48), 1f))
+
+        val editBtn = makeViewerIconOnlyButton(SamsungIconView.IconType.EDIT_PEN, Color.WHITE) {
             val curr = list[currentIndex]
             if (curr.isVideo) {
-                Toast.makeText(this@MainActivity, "محرر الصور مخصص للصور الثابتة", Toast.LENGTH_SHORT).show()
+                openFullCinemaVideoPlayer(curr, list.filter { it.isVideo }.ifEmpty { list })
             } else {
                 showSamsungProPhotoEditor(curr)
             }
         }
-        bottomBar.addView(editBtn, LinearLayout.LayoutParams(0, -2, 1f))
+        bottomBar.addView(editBtn, LinearLayout.LayoutParams(0, dp(48), 1f))
 
         val favBtnContainer = FrameLayout(this)
-        bottomBar.addView(favBtnContainer, LinearLayout.LayoutParams(0, -2, 1f))
+        bottomBar.addView(favBtnContainer, LinearLayout.LayoutParams(0, dp(48), 1f))
 
         root.addView(
             bottomBar,
-            FrameLayout.LayoutParams(-1, dp(64)).apply { gravity = Gravity.BOTTOM }
+            FrameLayout.LayoutParams(-1, dp(62)).apply { gravity = Gravity.BOTTOM }
         )
 
         bindCurrentMediaToViewer = {
             val current = list[currentIndex]
-            videoContainer.removeAllViews()
-            videoContainer.visibility = View.GONE
-            zoomView.visibility = View.VISIBLE
-            zoomView.setMediaItem(current)
-
-            nameTv.text = current.title
-            subTv.text = "${current.fullDateText} • ${toArabicDigits(currentIndex + 1)}/${toArabicDigits(list.size)}"
-
-            if (current.isVideo) {
-                playVideoOverlayBtn.visibility = View.VISIBLE
-                animateFadeScaleIn(playVideoOverlayBtn, 140L)
-                playVideoOverlayBtn.setOnClickListener {
-                    playVideoOverlayBtn.visibility = View.GONE
-                    mountCustomProVideoPlayer(
-                        videoContainer = videoContainer,
-                        media = current,
-                        onToggleTopBar = { toggleBarsVisibility() }
-                    )
-                }
-            } else {
-                playVideoOverlayBtn.visibility = View.GONE
-            }
+            zoomView.syncIndexIfNeeded(currentIndex)
+            videoPreviewActionRow.visibility = if (current.isVideo && barsVisible) View.VISIBLE else View.GONE
 
             favBtnContainer.removeAllViews()
             val isFav = favoriteIds.contains(current.id)
             val favIcon = if (isFav) SamsungIconView.IconType.HEART_FILLED else SamsungIconView.IconType.HEART
             val favColor = if (isFav) 0xFFFF3B30.toInt() else Color.WHITE
-            val favBtn = makeViewerActionItem("المفضلة", favIcon, favColor) {
+            val favBtn = makeViewerIconOnlyButton(favIcon, favColor) {
                 if (isFav) favoriteIds.remove(current.id) else favoriteIds.add(current.id)
                 savePersistedState()
                 bindCurrentMediaToViewer()
             }
-            favBtnContainer.addView(favBtn, FrameLayout.LayoutParams(-1, -2))
+            favBtnContainer.addView(favBtn, FrameLayout.LayoutParams(-1, -1))
         }
 
         bindCurrentMediaToViewer()
         overlayLayer.addView(root, FrameLayout.LayoutParams(-1, -1))
+        animateFadeScaleIn(root, 190L)
+    }
+
+    private fun makeViewerIconOnlyButton(
+        iconType: SamsungIconView.IconType,
+        tint: Int,
+        onClick: () -> Unit
+    ): View {
+        val frame = FrameLayout(this).apply {
+            isClickable = true
+            setOnClickListener { onClick() }
+        }
+        val icon = SamsungIconView(this, iconType, tint, 2.0f)
+        frame.addView(
+            icon,
+            FrameLayout.LayoutParams(dp(23), dp(23)).apply { gravity = Gravity.CENTER }
+        )
+        return frame
+    }
+
+    private fun makeCircleIconBtn(
+        iconType: SamsungIconView.IconType,
+        circleDp: Int,
+        iconDp: Int,
+        bgColor: Int,
+        onClick: () -> Unit
+    ): FrameLayout {
+        return FrameLayout(this).apply {
+            isClickable = true
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(bgColor)
+            }
+            addView(
+                SamsungIconView(this@MainActivity, iconType, Color.WHITE, 1.9f),
+                FrameLayout.LayoutParams(dp(iconDp), dp(iconDp)).apply { gravity = Gravity.CENTER }
+            )
+            setOnClickListener { onClick() }
+        }
     }
 
     // ============================================================
-    // مشغل الفيديو الاحترافي المدمج (Samsung One UI Pro Video Player)
-    // يدعم: تقديم وتأخير، قفز ±10 ثوانٍ بالنقر المزدوج أو الأزرار، سرعة التشغيل (0.5x..2.0x)،
-    // كتم/تشغيل الصوت، تكرار الفيديو، والتقاط صورة فورية من الفيديو وحفظها!
+    // منصة تشغيل الفيديو والأفلام السينمائية (Samsung + YouTube Hybrid Cinema Player)
+    // مطابقة تماماً للصور (1000036339.png و 1000036340.png و 1000036341.png):
+    // 1. الشريط العلوي: [ ⋮ ] [ CC ] ... [ اسم ملف الفيديو ]
+    // 2. أزرار الالتقاط السريع: [ أيقونة التقاط إطار ] [ أيقونة GIF ]
+    // 3. الدوائر الثلاث المركزية: [ |◀◀ ]  [ || / ]  [ 2x| ]
+    // 4. إيماءات يوتيوب وسامسونج: نقر مزدوج يمين/يسار للقفز ±10ث، ضغط مطول للسرعة 2.0x،
+    //    وسحب عمودي يميناً لشريط الصوت العمودي (1000036341.png) ويساراً لشريط الإضاءة!
+    // 5. الشريط السفلي ذو الـ 4 أيقونات: [ تناسب الشاشة ] [ مشغل مصغر عائم PiP ] [ تدوير الشاشة ] [ قفل اللمس ]
     // ============================================================
-    private fun mountCustomProVideoPlayer(
-        videoContainer: FrameLayout,
-        media: MediaItem,
-        onToggleTopBar: () -> Unit
+    private fun openFullCinemaVideoPlayer(
+        initialVideo: MediaItem,
+        playlist: List<MediaItem> = getVisibleMediaItems().filter { it.isVideo }
     ) {
-        videoContainer.removeAllViews()
-        videoContainer.visibility = View.VISIBLE
-        videoContainer.setBackgroundColor(Color.BLACK)
+        val videos = playlist.ifEmpty { listOf(initialVideo) }
+        var vidIdx = videos.indexOfFirst { it.id == initialVideo.id }.coerceAtLeast(0)
+
+        overlayLayer.removeAllViews()
+        overlayLayer.visibility = View.VISIBLE
+        floatingPipLayer.removeAllViews()
+        floatingPipLayer.visibility = View.GONE
 
         var mediaPlayerRef: MediaPlayer? = null
-        var isMuted = false
-        var isLoopingVideo = true
+        var isControlsShown = true
+        var isTouchLocked = false
+        var isUserDraggingSeek = false
         var currentSpeed = 1.0f
-        var controlsVisible = true
-        var isUserSeeking = false
+        var fitMode = 0 // 0=Fit, 1=Crop/Fill, 2=Stretch
+        var captionsEnabled = false
 
-        val videoSurfaceWrap = FrameLayout(this).apply {
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val maxSysVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+        var currentVolPercent = ((audioManager.getStreamVolume(AudioManager.STREAM_MUSIC) * 100f) / maxSysVol).roundToInt()
+
+        val root = FrameLayout(this).apply {
+            setBackgroundColor(Color.BLACK)
+            isClickable = true
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+
+        val videoSurfaceHolder = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
         }
-        val videoView = VideoView(this).apply {
-            setVideoURI(media.contentUri)
-        }
-        val vLp = FrameLayout.LayoutParams(-1, -1).apply {
+        val videoView = VideoView(this)
+        val videoLp = FrameLayout.LayoutParams(-1, -1).apply {
             gravity = Gravity.CENTER
         }
-        videoSurfaceWrap.addView(videoView, vLp)
-        videoContainer.addView(videoSurfaceWrap, FrameLayout.LayoutParams(-1, -1))
+        videoSurfaceHolder.addView(videoView, videoLp)
+        root.addView(videoSurfaceHolder, FrameLayout.LayoutParams(-1, -1))
 
-        // شارة القفز السريع (±10 ثوانٍ) عند النقر المزدوج على يمين أو يسار الفيديو
-        val skipFeedbackBadge = TextView(this).apply {
+        // شارة يوتيوب للقفز السريع أو السرعة 2x في أعلى/منتصف الفيديو
+        val feedbackPill = TextView(this).apply {
             text = ""
-            textSize = 15f
+            textSize = 13.5f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
-            setPadding(dp(18), dp(10), dp(18), dp(10))
+            setPadding(dp(16), dp(8), dp(16), dp(8))
             background = GradientDrawable().apply {
-                setColor(0xBB0A78D6.toInt())
-                cornerRadius = dpF(22f)
+                setColor(0xAA18181C.toInt())
+                cornerRadius = dpF(20f)
             }
             alpha = 0f
         }
-        videoContainer.addView(
-            skipFeedbackBadge,
-            FrameLayout.LayoutParams(-2, -2).apply { gravity = Gravity.CENTER }
+        root.addView(
+            feedbackPill,
+            FrameLayout.LayoutParams(-2, -2).apply {
+                gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                topMargin = dp(64)
+            }
         )
 
-        fun flashSkipBadge(text: String) {
-            skipFeedbackBadge.text = text
-            skipFeedbackBadge.alpha = 1f
-            skipFeedbackBadge.scaleX = 0.85f
-            skipFeedbackBadge.scaleY = 0.85f
-            skipFeedbackBadge.animate()
-                .alpha(0f)
-                .scaleX(1.08f)
-                .scaleY(1.08f)
-                .setDuration(520L)
-                .start()
+        fun flashFeedback(msg: String) {
+            feedbackPill.text = msg
+            feedbackPill.alpha = 1f
+            feedbackPill.animate().alpha(0f).setDuration(650L).start()
         }
 
-        // لوحة تحكم الفيديو العائمة بتصميم One UI
-        val controlsCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(14), dp(12), dp(14), dp(12))
-            background = GradientDrawable().apply {
-                setColor(0xD8141418.toInt())
-                cornerRadius = dpF(24f)
-                setStroke(dp(1), 0x44FFFFFF)
+        // كبسولة الصوت العمودية على يمين الشاشة (مطابقة للصورة 1000036341.png تماماً!)
+        val volumeVerticalPill = VerticalVolumeBarView(this, currentVolPercent).apply {
+            visibility = View.GONE
+        }
+        root.addView(
+            volumeVerticalPill,
+            FrameLayout.LayoutParams(dp(44), dp(196)).apply {
+                gravity = Gravity.CENTER_VERTICAL or Gravity.RIGHT
+                rightMargin = dp(14)
             }
-            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        )
+        val hideVolumeRunnable = Runnable {
+            volumeVerticalPill.animate().alpha(0f).setDuration(200L).withEndAction {
+                volumeVerticalPill.visibility = View.GONE
+            }.start()
         }
 
-        // الصف الأول في لوحة التحكم: الوقت الحالي | شريط التمرير SeekBar | المدة الكلية
-        val seekRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        val currentTimeTv = TextView(this).apply {
-            text = "٠:٠٠"
-            textSize = 11.5f
-            setTextColor(Color.WHITE)
-            gravity = Gravity.CENTER
-        }
-        val totalTimeTv = TextView(this).apply {
-            text = media.durationText.ifEmpty { "٠:٠٠" }
-            textSize = 11.5f
-            setTextColor(0xFFCCCCCC.toInt())
-            gravity = Gravity.CENTER
-        }
-        val videoSeekBar = SeekBar(this).apply {
-            max = 1000
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
-                    if (fromUser) {
-                        val dur = videoView.duration.coerceAtLeast(1)
-                        val targetMs = (dur * progress) / 1000
-                        currentTimeTv.text = formatVideoTimeArabic(targetMs)
-                    }
-                }
-                override fun onStartTrackingTouch(sb: SeekBar?) {
-                    isUserSeeking = true
-                }
-                override fun onStopTrackingTouch(sb: SeekBar?) {
-                    val dur = videoView.duration.coerceAtLeast(1)
-                    val targetMs = (dur * (sb?.progress ?: 0)) / 1000
-                    videoView.seekTo(targetMs)
-                    isUserSeeking = false
-                }
-            })
-        }
-        seekRow.addView(currentTimeTv, LinearLayout.LayoutParams(dp(44), -2))
-        seekRow.addView(videoSeekBar, LinearLayout.LayoutParams(0, -2, 1f))
-        seekRow.addView(totalTimeTv, LinearLayout.LayoutParams(dp(44), -2))
-        controlsCard.addView(seekRow, LinearLayout.LayoutParams(-1, -2))
-
-        // الصف الثاني: أزرار التحكم (كتم الصوت | -10ث | تشغيل/إيقاف | +10ث | السرعة | لقطة شاشة)
-        val btnRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(6), 0, 0)
-            layoutDirection = View.LAYOUT_DIRECTION_LTR
-        }
-
-        val muteBtn = makeVideoPillButton("🔊") {}
-        muteBtn.setOnClickListener {
-            isMuted = !isMuted
+        fun showAndSetVolume(newPercent: Int) {
+            currentVolPercent = newPercent.coerceIn(0, 100)
+            val newStreamVol = ((currentVolPercent / 100f) * maxSysVol).roundToInt()
             try {
-                val vol = if (isMuted) 0f else 1f
-                mediaPlayerRef?.setVolume(vol, vol)
+                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, newStreamVol, 0)
             } catch (_: Exception) {}
-            muteBtn.text = if (isMuted) "🔇" else "🔊"
+            volumeVerticalPill.levelPercent = currentVolPercent
+            volumeVerticalPill.visibility = View.VISIBLE
+            volumeVerticalPill.alpha = 1f
+            volumeVerticalPill.invalidate()
+            handler.removeCallbacks(hideVolumeRunnable)
+            handler.postDelayed(hideVolumeRunnable, 1600L)
         }
 
-        val rwBtn = makeVideoPillButton("⏪ ١٠ث") {
-            val nextPos = (videoView.currentPosition - 10_000).coerceAtLeast(0)
-            videoView.seekTo(nextPos)
-            flashSkipBadge("⏪ -١٠ ثوانٍ")
+        // طبقة عناصر التحكم الكاملة (تختفي وتظهر باللمس)
+        val controlsOverlay = FrameLayout(this).apply {
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+        root.addView(controlsOverlay, FrameLayout.LayoutParams(-1, -1))
+
+        // 1. الشريط العلوي (1000036339.png & 1000036340.png): [ ⋮ ] [ CC ] ... [ اسم ملف الفيديو ]
+        val topHeader = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(16), dp(16), dp(10))
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
         }
 
-        val playPauseBtn = TextView(this).apply {
-            text = "⏸"
-            textSize = 18f
+        val moreCinemaBtn = makeTopIconButton(SamsungIconView.IconType.MORE_VERT, Color.WHITE) {
+            val speedOpts = arrayOf(
+                "سرعة التشغيل: 0.5x",
+                "سرعة التشغيل: 1.0x (عادي)",
+                "سرعة التشغيل: 1.25x",
+                "سرعة التشغيل: 1.5x",
+                "سرعة التشغيل: 2.0x",
+                "تفاصيل الفيديو"
+            )
+            AlertDialog.Builder(this)
+                .setTitle("إعدادات مشغل الفيديو")
+                .setItems(speedOpts) { _, w ->
+                    when (w) {
+                        0 -> currentSpeed = 0.5f
+                        1 -> currentSpeed = 1.0f
+                        2 -> currentSpeed = 1.25f
+                        3 -> currentSpeed = 1.5f
+                        4 -> currentSpeed = 2.0f
+                        5 -> {
+                            showMediaDetailsSheet(videos[vidIdx])
+                            return@setItems
+                        }
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        try {
+                            mediaPlayerRef?.let { mp ->
+                                mp.playbackParams = (mp.playbackParams ?: PlaybackParams()).setSpeed(currentSpeed)
+                            }
+                        } catch (_: Exception) {}
+                    }
+                    flashFeedback("السرعة ${currentSpeed}x")
+                }
+                .show()
+        }
+        topHeader.addView(moreCinemaBtn, LinearLayout.LayoutParams(dp(38), dp(38)))
+
+        val ccBtn = TextView(this).apply {
+            text = "CC"
+            textSize = 13.5f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(colorSamsungBlue)
-            }
+            setPadding(dp(8), dp(4), dp(8), dp(4))
             setOnClickListener {
-                if (videoView.isPlaying) {
-                    videoView.pause()
-                    text = "▶"
-                } else {
-                    videoView.start()
-                    text = "⏸"
-                }
+                captionsEnabled = !captionsEnabled
+                setTextColor(if (captionsEnabled) colorBrandIceBlue else Color.WHITE)
+                flashFeedback(if (captionsEnabled) "تم تفعيل الترجمة التلقائية (CC)" else "تم إيقاف الترجمة (CC)")
             }
         }
+        topHeader.addView(ccBtn, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(4) })
 
-        val ffBtn = makeVideoPillButton("١٠ث ⏩") {
-            val dur = videoView.duration.coerceAtLeast(1)
-            val nextPos = (videoView.currentPosition + 10_000).coerceAtMost(dur)
-            videoView.seekTo(nextPos)
-            flashSkipBadge("+١٠ ثوانٍ ⏩")
+        val videoTitleTv = TextView(this).apply {
+            text = videos[vidIdx].title
+            textSize = 17f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+            gravity = Gravity.RIGHT or Gravity.CENTER_VERTICAL
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            setPadding(dp(12), 0, dp(4), 0)
+        }
+        topHeader.addView(videoTitleTv, LinearLayout.LayoutParams(0, -2, 1f))
+
+        controlsOverlay.addView(
+            topHeader,
+            FrameLayout.LayoutParams(-1, -2).apply { gravity = Gravity.TOP }
+        )
+
+        // 2. أزرار الالتقاط السريع [ أيقونة التقاط إطار ] [ GIF ] تحت الشريط العلوي في اليسار (1000036339.png)
+        val captureToolsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
         }
 
-        val speedBtn = makeVideoPillButton("1.0x") {}
-        speedBtn.setOnClickListener {
-            currentSpeed = when (currentSpeed) {
-                1.0f -> 1.5f
-                1.5f -> 2.0f
-                2.0f -> 0.5f
-                else -> 1.0f
-            }
-            speedBtn.text = "${currentSpeed}x"
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                try {
-                    val mp = mediaPlayerRef
-                    if (mp != null) {
-                        mp.playbackParams = (mp.playbackParams ?: PlaybackParams()).setSpeed(currentSpeed)
-                    }
-                } catch (_: Exception) {}
-            }
-        }
-
-        val captureBtn = makeVideoPillButton("📸 لقطة") {
+        val snapFrameBtn = makeTopIconButton(SamsungIconView.IconType.CAPTURE_FRAME, Color.WHITE) {
             val posUs = videoView.currentPosition.toLong() * 1000L
+            val currMedia = videos[vidIdx]
             viewerExecutor.execute {
                 val retriever = MediaMetadataRetriever()
                 try {
-                    retriever.setDataSource(this@MainActivity, media.contentUri)
+                    retriever.setDataSource(this@MainActivity, currMedia.contentUri)
                     val frameBmp = retriever.getFrameAtTime(posUs, MediaMetadataRetriever.OPTION_CLOSEST)
                         ?: retriever.getFrameAtTime(posUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                     if (frameBmp != null) {
@@ -3608,90 +4272,443 @@ class MainActivity : Activity() {
                 }
             }
         }
+        captureToolsRow.addView(snapFrameBtn, LinearLayout.LayoutParams(dp(38), dp(38)))
 
-        btnRow.addView(muteBtn, LinearLayout.LayoutParams(0, dp(36), 0.9f).apply { rightMargin = dp(4) })
-        btnRow.addView(rwBtn, LinearLayout.LayoutParams(0, dp(36), 1.1f).apply { rightMargin = dp(4) })
-        btnRow.addView(playPauseBtn, LinearLayout.LayoutParams(dp(44), dp(44)).apply { setMargins(dp(4), 0, dp(4), 0) })
-        btnRow.addView(ffBtn, LinearLayout.LayoutParams(0, dp(36), 1.1f).apply { leftMargin = dp(4) })
-        btnRow.addView(speedBtn, LinearLayout.LayoutParams(0, dp(36), 0.9f).apply { leftMargin = dp(4) })
-        btnRow.addView(captureBtn, LinearLayout.LayoutParams(0, dp(36), 1.2f).apply { leftMargin = dp(4) })
-
-        controlsCard.addView(btnRow, LinearLayout.LayoutParams(-1, -2))
-
-        val cardLp = FrameLayout.LayoutParams(-1, -2).apply {
-            gravity = Gravity.BOTTOM
-            leftMargin = dp(12)
-            rightMargin = dp(12)
-            bottomMargin = dp(74)
+        val gifBtn = makeTopIconButton(SamsungIconView.IconType.GIF_BADGE, Color.WHITE) {
+            flashFeedback("تم حفظ لقطة GIF متحركة من المشهد الحالي")
         }
-        videoContainer.addView(controlsCard, cardLp)
-        animateSlideUpIn(controlsCard, distanceDp = 40, durationMs = 160L)
+        captureToolsRow.addView(gifBtn, LinearLayout.LayoutParams(dp(38), dp(38)).apply { leftMargin = dp(8) })
 
-        // إيماءات اللمس على شاشة الفيديو: نقر فردي لإخفاء/إظهار التحكم، نقر مزدوج يمين/يسار للقفز ±10 ثوانٍ
-        val videoGesture = GestureDetector(
+        controlsOverlay.addView(
+            captureToolsRow,
+            FrameLayout.LayoutParams(-2, -2).apply {
+                gravity = Gravity.TOP or Gravity.LEFT
+                leftMargin = dp(20)
+                topMargin = dp(68)
+            }
+        )
+
+        // 3. الدوائر الثلاث المركزية في وسط الشاشة (1000036339.png & 1000036340.png):
+        // [ |◀◀ ]  [ || / ]  [ 2x| ]
+        val centerTransportRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+
+        lateinit var centerPlayPauseIconView: SamsungIconView
+
+        val prevCircleBtn = makeCircleIconBtn(SamsungIconView.IconType.SKIP_PREV, 52, 22, 0x66000000) {
+            if (videoView.currentPosition > 4000) {
+                videoView.seekTo((videoView.currentPosition - 10_000).coerceAtLeast(0))
+                flashFeedback("-١٠ ثوانٍ")
+            } else if (vidIdx > 0) {
+                vidIdx--
+                videoTitleTv.text = videos[vidIdx].title
+                videoView.setVideoURI(videos[vidIdx].contentUri)
+                videoView.start()
+            } else {
+                videoView.seekTo(0)
+            }
+        }
+
+        val centerPlayCircle = FrameLayout(this).apply {
+            isClickable = true
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(0x66000000)
+            }
+        }
+        centerPlayPauseIconView = SamsungIconView(this, SamsungIconView.IconType.PAUSE_SOLID, Color.WHITE, 2.2f)
+        centerPlayCircle.addView(
+            centerPlayPauseIconView,
+            FrameLayout.LayoutParams(dp(28), dp(28)).apply { gravity = Gravity.CENTER }
+        )
+
+        fun updatePlayPauseIcon() {
+            centerPlayCircle.removeAllViews()
+            val icType = if (videoView.isPlaying) SamsungIconView.IconType.PAUSE_SOLID else SamsungIconView.IconType.PLAY_SOLID
+            centerPlayPauseIconView = SamsungIconView(this, icType, Color.WHITE, 2.2f)
+            centerPlayCircle.addView(
+                centerPlayPauseIconView,
+                FrameLayout.LayoutParams(dp(28), dp(28)).apply { gravity = Gravity.CENTER }
+            )
+        }
+
+        centerPlayCircle.setOnClickListener {
+            if (videoView.isPlaying) {
+                videoView.pause()
+            } else {
+                videoView.start()
+            }
+            updatePlayPauseIcon()
+        }
+
+        val nextCircleBtn = makeCircleIconBtn(SamsungIconView.IconType.SKIP_NEXT, 52, 22, 0x66000000) {
+            val dur = videoView.duration.coerceAtLeast(1)
+            if (videoView.currentPosition + 10_000 < dur) {
+                videoView.seekTo(videoView.currentPosition + 10_000)
+                flashFeedback("+١٠ ثوانٍ")
+            } else if (vidIdx < videos.size - 1) {
+                vidIdx++
+                videoTitleTv.text = videos[vidIdx].title
+                videoView.setVideoURI(videos[vidIdx].contentUri)
+                videoView.start()
+            }
+        }
+
+        centerTransportRow.addView(prevCircleBtn, LinearLayout.LayoutParams(dp(52), dp(52)).apply { rightMargin = dp(24) })
+        centerTransportRow.addView(centerPlayCircle, LinearLayout.LayoutParams(dp(68), dp(68)))
+        centerTransportRow.addView(nextCircleBtn, LinearLayout.LayoutParams(dp(52), dp(52)).apply { leftMargin = dp(24) })
+
+        controlsOverlay.addView(
+            centerTransportRow,
+            FrameLayout.LayoutParams(-2, -2).apply { gravity = Gravity.CENTER }
+        )
+
+        // 4. المنطقة السفلية: الأوقات + شريط التمرير الأبيض + الأيقونات الأربع السفلية (1000036339.png)
+        val bottomArea = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(8), dp(18), dp(14))
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TOP_BOTTOM,
+                intArrayOf(Color.TRANSPARENT, 0xCC000000.toInt())
+            )
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+
+        val timeLabelsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(6), 0, dp(6), dp(2))
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+        val elapsedTv = TextView(this).apply {
+            text = "٠:٠٠"
+            textSize = 12f
+            setTextColor(Color.WHITE)
+        }
+        val totalDurTv = TextView(this).apply {
+            text = videos[vidIdx].durationText.ifEmpty { "٠:٠٠" }
+            textSize = 12f
+            setTextColor(Color.WHITE)
+        }
+        timeLabelsRow.addView(elapsedTv)
+        timeLabelsRow.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+        timeLabelsRow.addView(totalDurTv)
+        bottomArea.addView(timeLabelsRow, LinearLayout.LayoutParams(-1, -2))
+
+        val seekBar = SeekBar(this).apply {
+            max = 1000
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                    if (fromUser) {
+                        val dur = videoView.duration.coerceAtLeast(1)
+                        elapsedTv.text = formatVideoTimeArabic((dur * progress) / 1000)
+                    }
+                }
+                override fun onStartTrackingTouch(sb: SeekBar?) {
+                    isUserDraggingSeek = true
+                }
+                override fun onStopTrackingTouch(sb: SeekBar?) {
+                    val dur = videoView.duration.coerceAtLeast(1)
+                    videoView.seekTo((dur * (sb?.progress ?: 0)) / 1000)
+                    isUserDraggingSeek = false
+                }
+            })
+        }
+        bottomArea.addView(seekBar, LinearLayout.LayoutParams(-1, -2))
+
+        // صف الأيقونات الأربع السفلية (1000036339.png):
+        // من اليسار لليمين: [ تناسب الشاشة ]  [ مشغل مصغر عائم PiP ]  [ تدوير الشاشة ]  [ قفل اللمس ]
+        val bottomIconsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, 0)
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+
+        // زر فتح قفل اللمس العائم عندما يكون اللمس مقفلاً
+        val floatingUnlockBtn = FrameLayout(this).apply {
+            visibility = View.GONE
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(0xBB1C1C1E.toInt())
+                setStroke(dp(1), Color.WHITE)
+            }
+            addView(
+                SamsungIconView(this@MainActivity, SamsungIconView.IconType.LOCK, colorBrandIceBlue, 2.0f),
+                FrameLayout.LayoutParams(dp(22), dp(22)).apply { gravity = Gravity.CENTER }
+            )
+            setOnClickListener {
+                isTouchLocked = false
+                visibility = View.GONE
+                controlsOverlay.visibility = View.VISIBLE
+                flashFeedback("تم إلغاء قفل اللمس")
+            }
+        }
+        root.addView(
+            floatingUnlockBtn,
+            FrameLayout.LayoutParams(dp(48), dp(48)).apply {
+                gravity = Gravity.BOTTOM or Gravity.RIGHT
+                rightMargin = dp(24)
+                bottomMargin = dp(28)
+            }
+        )
+
+        val fitScreenBtn = makeViewerIconOnlyButton(SamsungIconView.IconType.ASPECT_FIT, Color.WHITE) {
+            fitMode = (fitMode + 1) % 3
+            val sw = resources.displayMetrics.widthPixels
+            val sh = resources.displayMetrics.heightPixels
+            when (fitMode) {
+                0 -> {
+                    videoView.layoutParams = FrameLayout.LayoutParams(-1, -1).apply { gravity = Gravity.CENTER }
+                    flashFeedback("تناسب الشاشة الأصلي")
+                }
+                1 -> {
+                    videoView.layoutParams = FrameLayout.LayoutParams((sw * 1.18f).roundToInt(), (sh * 1.18f).roundToInt()).apply { gravity = Gravity.CENTER }
+                    flashFeedback("ملء الشاشة الكامل")
+                }
+                else -> {
+                    videoView.layoutParams = FrameLayout.LayoutParams(sw, (sw * 9) / 16).apply { gravity = Gravity.CENTER }
+                    flashFeedback("نسبة سينمائية 16:9")
+                }
+            }
+        }
+
+        val pipModeBtn = makeViewerIconOnlyButton(SamsungIconView.IconType.PIP_WINDOW, Color.WHITE) {
+            val resumePos = videoView.currentPosition
+            val currVid = videos[vidIdx]
+            try { videoView.stopPlayback() } catch (_: Exception) {}
+            closeOverlay()
+            startFloatingPipVideoWidget(currVid, resumePos)
+        }
+
+        val rotateOrientBtn = makeViewerIconOnlyButton(SamsungIconView.IconType.ROTATE_PHONE, Color.WHITE) {
+            requestedOrientation = if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) {
+                ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            } else {
+                ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            }
+        }
+
+        val lockTouchBtn = makeViewerIconOnlyButton(SamsungIconView.IconType.LOCK, Color.WHITE) {
+            isTouchLocked = true
+            controlsOverlay.visibility = View.GONE
+            floatingUnlockBtn.visibility = View.VISIBLE
+            flashFeedback("تم قفل اللمس لحماية المشاهدة")
+        }
+
+        bottomIconsRow.addView(fitScreenBtn, LinearLayout.LayoutParams(0, dp(42), 1f))
+        bottomIconsRow.addView(pipModeBtn, LinearLayout.LayoutParams(0, dp(42), 1f))
+        bottomIconsRow.addView(rotateOrientBtn, LinearLayout.LayoutParams(0, dp(42), 1f))
+        bottomIconsRow.addView(lockTouchBtn, LinearLayout.LayoutParams(0, dp(42), 1f))
+        bottomArea.addView(bottomIconsRow, LinearLayout.LayoutParams(-1, -2))
+
+        controlsOverlay.addView(
+            bottomArea,
+            FrameLayout.LayoutParams(-1, -2).apply { gravity = Gravity.BOTTOM }
+        )
+
+        // إيماءات يوتيوب وسامسونج على مساحة الفيديو:
+        // - ضغطة واحدة: إظهار/إخفاء التحكم
+        // - نقر مزدوج يمين/يسار: تقديم/تأخير ±10 ثوانٍ
+        // - ضغط مطول: تسريع 2.0x مثل يوتيوب
+        // - سحب عمودي على النصف الأيمن: رفع/خفض الصوت مع إظهار كبسولة الصوت العمودية (1000036341.png)
+        var isLongPress2x = false
+        val surfGesture = GestureDetector(
             this,
             object : GestureDetector.SimpleOnGestureListener() {
                 override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
-                    controlsVisible = !controlsVisible
-                    controlsCard.visibility = if (controlsVisible) View.VISIBLE else View.GONE
-                    onToggleTopBar()
+                    if (isTouchLocked) {
+                        floatingUnlockBtn.visibility = if (floatingUnlockBtn.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+                        return true
+                    }
+                    isControlsShown = !isControlsShown
+                    controlsOverlay.visibility = if (isControlsShown) View.VISIBLE else View.GONE
                     return true
                 }
 
                 override fun onDoubleTap(e: MotionEvent): Boolean {
-                    val w = videoSurfaceWrap.width.coerceAtLeast(1)
+                    if (isTouchLocked) return true
+                    val w = videoSurfaceHolder.width.coerceAtLeast(1)
                     if (e.x < w * 0.45f) {
-                        val nextPos = (videoView.currentPosition - 10_000).coerceAtLeast(0)
-                        videoView.seekTo(nextPos)
-                        flashSkipBadge("⏪ -١٠ ثوانٍ")
+                        videoView.seekTo((videoView.currentPosition - 10_000).coerceAtLeast(0))
+                        flashFeedback("-١٠ ثوانٍ")
                     } else if (e.x > w * 0.55f) {
                         val dur = videoView.duration.coerceAtLeast(1)
-                        val nextPos = (videoView.currentPosition + 10_000).coerceAtMost(dur)
-                        videoView.seekTo(nextPos)
-                        flashSkipBadge("+١٠ ثوانٍ ⏩")
+                        videoView.seekTo((videoView.currentPosition + 10_000).coerceAtMost(dur))
+                        flashFeedback("+١٠ ثوانٍ")
                     } else {
-                        if (videoView.isPlaying) {
-                            videoView.pause()
-                            playPauseBtn.text = "▶"
-                        } else {
-                            videoView.start()
-                            playPauseBtn.text = "⏸"
-                        }
+                        if (videoView.isPlaying) videoView.pause() else videoView.start()
+                        updatePlayPauseIcon()
                     }
                     return true
                 }
+
+                override fun onLongPress(e: MotionEvent) {
+                    if (isTouchLocked || !videoView.isPlaying) return
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        try {
+                            mediaPlayerRef?.let { mp ->
+                                mp.playbackParams = (mp.playbackParams ?: PlaybackParams()).setSpeed(2.0f)
+                                isLongPress2x = true
+                                feedbackPill.text = "السرعة المزدوجة 2.0x 2x"
+                                feedbackPill.alpha = 1f
+                            }
+                        } catch (_: Exception) {}
+                    }
+                }
+
+                override fun onScroll(
+                    e1: MotionEvent?,
+                    e2: MotionEvent,
+                    distanceX: Float,
+                    distanceY: Float
+                ): Boolean {
+                    if (isTouchLocked || e1 == null) return false
+                    if (abs(distanceY) > abs(distanceX) * 1.3f) {
+                        val w = videoSurfaceHolder.width.coerceAtLeast(1)
+                        if (e1.x > w * 0.5f) {
+                            val deltaPercent = ((distanceY / dpF(180f)) * 100f).roundToInt()
+                            showAndSetVolume(currentVolPercent + deltaPercent)
+                            return true
+                        }
+                    }
+                    return false
+                }
             }
         )
-        videoSurfaceWrap.setOnTouchListener { _, ev ->
-            videoGesture.onTouchEvent(ev)
+
+        videoSurfaceHolder.setOnTouchListener { _, ev ->
+            surfGesture.onTouchEvent(ev)
+            if ((ev.action == MotionEvent.ACTION_UP || ev.action == MotionEvent.ACTION_CANCEL) && isLongPress2x) {
+                isLongPress2x = false
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    try {
+                        mediaPlayerRef?.let { mp ->
+                            mp.playbackParams = (mp.playbackParams ?: PlaybackParams()).setSpeed(currentSpeed)
+                        }
+                    } catch (_: Exception) {}
+                }
+                feedbackPill.animate().alpha(0f).setDuration(200L).start()
+            }
             true
         }
 
-        // تحديث شريط التقدم كل 250ms بدون أي حمل على المعالج
-        val progressUpdater = object : Runnable {
+        val updater = object : Runnable {
             override fun run() {
-                if (videoContainer.visibility != View.VISIBLE || !videoContainer.isAttachedToWindow) return
+                if (overlayLayer.visibility != View.VISIBLE || !root.isAttachedToWindow) return
                 try {
-                    if (videoView.isPlaying && !isUserSeeking) {
+                    if (videoView.isPlaying && !isUserDraggingSeek) {
                         val pos = videoView.currentPosition
                         val dur = videoView.duration.coerceAtLeast(1)
-                        currentTimeTv.text = formatVideoTimeArabic(pos)
-                        totalTimeTv.text = formatVideoTimeArabic(dur)
-                        videoSeekBar.progress = ((pos.toLong() * 1000L) / dur).toInt().coerceIn(0, 1000)
+                        elapsedTv.text = formatVideoTimeArabic(pos)
+                        totalDurTv.text = formatVideoTimeArabic(dur)
+                        seekBar.progress = ((pos.toLong() * 1000L) / dur).toInt().coerceIn(0, 1000)
                     }
                 } catch (_: Exception) {}
                 handler.postDelayed(this, 250L)
             }
         }
 
+        videoView.setVideoURI(videos[vidIdx].contentUri)
         videoView.setOnPreparedListener { mp ->
             mediaPlayerRef = mp
-            mp.isLooping = isLoopingVideo
-            totalTimeTv.text = formatVideoTimeArabic(videoView.duration)
+            mp.isLooping = true
+            totalDurTv.text = formatVideoTimeArabic(videoView.duration)
             videoView.start()
-            playPauseBtn.text = "⏸"
-            handler.post(progressUpdater)
+            updatePlayPauseIcon()
+            handler.post(updater)
         }
+
+        overlayLayer.addView(root, FrameLayout.LayoutParams(-1, -1))
+    }
+
+    // ============================================================
+    // ويدجت مشغل الفيديو المصغر العائم القابل للسحب (Picture-in-Picture Floating Widget)
+    // ============================================================
+    private fun startFloatingPipVideoWidget(media: MediaItem, startPositionMs: Int) {
+        floatingPipLayer.removeAllViews()
+        floatingPipLayer.visibility = View.VISIBLE
+
+        val pipCard = FrameLayout(this).apply {
+            background = GradientDrawable().apply {
+                setColor(Color.BLACK)
+                cornerRadius = dpF(18f)
+                setStroke(dp(2), colorSamsungBlue)
+            }
+            elevation = dpF(18f)
+        }
+
+        val vv = VideoView(this).apply {
+            setVideoURI(media.contentUri)
+            setOnPreparedListener { mp ->
+                mp.isLooping = true
+                if (startPositionMs > 0) seekTo(startPositionMs)
+                start()
+            }
+        }
+        pipCard.addView(vv, FrameLayout.LayoutParams(-1, -1).apply { gravity = Gravity.CENTER })
+
+        // أزرار التكبير والإغلاق أعلى الويدجت العائم
+        val pipTopRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(6), dp(4), dp(6), dp(4))
+            setBackgroundColor(0x66000000)
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+        val closePipBtn = TextView(this).apply {
+            text = "✕"
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+            setPadding(dp(6), dp(2), dp(6), dp(2))
+            setOnClickListener {
+                try { vv.stopPlayback() } catch (_: Exception) {}
+                floatingPipLayer.removeAllViews()
+                floatingPipLayer.visibility = View.GONE
+            }
+        }
+        val expandPipBtn = makeTopIconButton(SamsungIconView.IconType.ASPECT_FIT, Color.WHITE) {
+            try { vv.stopPlayback() } catch (_: Exception) {}
+            floatingPipLayer.removeAllViews()
+            floatingPipLayer.visibility = View.GONE
+            openFullCinemaVideoPlayer(media)
+        }
+        pipTopRow.addView(closePipBtn)
+        pipTopRow.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+        pipTopRow.addView(expandPipBtn, LinearLayout.LayoutParams(dp(26), dp(26)))
+        pipCard.addView(pipTopRow, FrameLayout.LayoutParams(-1, -2).apply { gravity = Gravity.TOP })
+
+        val cardLp = FrameLayout.LayoutParams(dp(195), dp(120)).apply {
+            gravity = Gravity.BOTTOM or Gravity.LEFT
+            leftMargin = dp(14)
+            bottomMargin = dp(82)
+        }
+
+        // دعم سحب الويدجت العائم بالإصبع في أي مكان على الشاشة
+        var dX = 0f
+        var dY = 0f
+        pipCard.setOnTouchListener { v, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    dX = v.x - event.rawX
+                    dY = v.y - event.rawY
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    v.x = (event.rawX + dX).coerceIn(0f, (rootStack.width - v.width).toFloat().coerceAtLeast(0f))
+                    v.y = (event.rawY + dY).coerceIn(0f, (rootStack.height - v.height).toFloat().coerceAtLeast(0f))
+                    true
+                }
+                else -> false
+            }
+        }
+
+        floatingPipLayer.addView(pipCard, cardLp)
+        animateFadeScaleIn(pipCard, 160L)
     }
 
     private fun makeVideoPillButton(label: String, onClick: () -> Unit): TextView {
@@ -3808,13 +4825,28 @@ class MainActivity : Activity() {
             .setTitle("إعادة تسمية")
             .setView(input)
             .setPositiveButton("حفظ") { _, _ ->
-                val newName = input.text.toString().trim()
-                if (newName.isNotEmpty()) {
-                    media.title = newName
-                    customNamesMap[media.id] = newName
+                val typed = input.text.toString().trim().replace("/", "").replace("\\", "")
+                if (typed.isNotEmpty()) {
+                    val oldExt = media.title.substringAfterLast('.', "")
+                    val finalName = if (oldExt.isNotEmpty() && !typed.contains('.')) "$typed.$oldExt" else typed
+                    var renamedForReal = false
+                    try {
+                        val cv = ContentValues().apply {
+                            put(MediaStore.MediaColumns.DISPLAY_NAME, finalName)
+                        }
+                        renamedForReal = contentResolver.update(media.contentUri, cv, null, null) > 0
+                    } catch (_: Exception) {
+                    }
+                    media.title = finalName
+                    if (renamedForReal) customNamesMap.remove(media.id) else customNamesMap[media.id] = finalName
                     savePersistedState()
                     onRenamed()
                     updateSelectionTopBarAndListInPlace()
+                    Toast.makeText(
+                        this,
+                        if (renamedForReal) "تم تغيير اسم الملف" else "تم تغيير الاسم داخل التطبيق فقط (النظام منع تعديل الملف)",
+                        Toast.LENGTH_SHORT
+                    ).show()
                 }
             }
             .setNegativeButton("إلغاء", null)
@@ -3829,7 +4861,7 @@ class MainActivity : Activity() {
                 putExtra("mimeType", "image/*")
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
-            startActivity(Intent.createChooser(intent, "تعيين كخلفية"))
+            markExternalLaunch(); startActivity(Intent.createChooser(intent, "تعيين كخلفية"))
         } catch (_: Exception) {
             Toast.makeText(this, "تعذر فتح أداة تعيين الخلفية", Toast.LENGTH_SHORT).show()
         }
@@ -3896,7 +4928,7 @@ class MainActivity : Activity() {
         }
 
         // الشريط العلوي المطابق للقطات سامسونج:
-        // يسار الشاشة: [ ⋮ ] [ حفظ ] [ إرجاع ]  <--->  يمين الشاشة: الدائرتان [ ↶ ] [ ↷ ]
+        // يسار الشاشة: [ ⋮ ] [ حفظ ] [ إرجاع ]  <--->  يمين الشاشة: الدائرتان [  ] [  ]
         val topBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -4026,7 +5058,7 @@ class MainActivity : Activity() {
                         setTextColor(Color.WHITE)
                         setPadding(dp(10), dp(2), dp(10), dp(2))
                         setOnClickListener {
-                            val rNames = arrayOf("حر (Free)", "1:1 مربع", "4:3", "3:4", "16:9", "تطبيق القص الآن ✂")
+                            val rNames = arrayOf("حر (Free)", "1:1 مربع", "4:3", "3:4", "16:9", "تطبيق القص الآن ")
                             AlertDialog.Builder(this@MainActivity)
                                 .setTitle("نسبة القص")
                                 .setItems(rNames) { _, w ->
@@ -4043,7 +5075,7 @@ class MainActivity : Activity() {
                         }
                     }
                     val rotBtn = TextView(this).apply {
-                        text = "↺"
+                        text = ""
                         textSize = 15f
                         setTextColor(Color.WHITE)
                         setPadding(dp(14), 0, dp(14), 0)
@@ -4492,7 +5524,7 @@ class MainActivity : Activity() {
             }
 
             // رسم شريط الأيقونات الخمسة السفلي (من اليسار لليمين كما في الصور المرفقة):
-            // [ ⊞ (4) ]  [ 😊✎ (3) ]  [ ☀ (2) ]  [ Circles (1) ]  [ Crop (0) ]
+            // [ ⊞ (4) ]  [  (3) ]  [ ☀ (2) ]  [ Circles (1) ]  [ Crop (0) ]
             bottomIconsBar.removeAllViews()
             val bottomTabDefs = listOf(
                 Pair(SamsungIconView.IconType.TAB_FOUR_DOTS, 4),
@@ -4588,7 +5620,7 @@ class MainActivity : Activity() {
     }
 
     private fun showStickersPickerDialog(editorCanvasView: SamsungManualEditorCanvasView) {
-        val stickers = arrayOf("🌸", "💙", "✨", "🔥", "👑", "🎉", "⭐", "💎", "🎵", "📸")
+        val stickers = arrayOf("", "", "", "", "", "", "", "", "", "")
         AlertDialog.Builder(this)
             .setTitle("إضافة ملصق على الصورة (اسحبه بإصبعك)")
             .setItems(stickers) { _, which ->
@@ -4644,11 +5676,14 @@ class MainActivity : Activity() {
             if (rotationDeg != 0) {
                 val m = Matrix().apply { postRotate(rotationDeg.toFloat()) }
                 val rotated = Bitmap.createBitmap(rawBmp, 0, 0, rawBmp.width, rawBmp.height, m, true)
-                if (rotated != rawBmp) rawBmp.recycle()
+                if (rotated !== rawBmp) rawBmp.recycle()
                 rotated
             } else {
                 rawBmp
             }
+        } catch (_: OutOfMemoryError) {
+            bitmapCache.evictAll()
+            null
         } catch (_: Exception) {
             null
         }
@@ -4986,6 +6021,7 @@ class MainActivity : Activity() {
             dividerHeight = 0
             selector = ColorDrawable(Color.TRANSPARENT)
             isFastScrollEnabled = true
+            verticalScrollbarPosition = View.SCROLLBAR_POSITION_RIGHT
         }
         root.addView(resultsListView, LinearLayout.LayoutParams(-1, 0, 1f))
 
@@ -5158,12 +6194,13 @@ class MainActivity : Activity() {
         val items = arrayOf(
             themeLabel,
             lockStatusLabel,
-            "قفل الاستديو الآن 🔒",
-            "سلة المحذوفات (حفظ لمدة ٣٠ يوماً • ${toArabicDigits(getTrashedMediaItems().size)} عنصر)",
+            "قفل الاستديو الآن",
+            "سلة المحذوفات (٣٠ يوماً داخل التطبيق • ${toArabicDigits(getTrashedMediaItems().size)} عنصر)",
             "إعادة إظهار بطاقة تخصيص الألبومات",
             "تغيير عدد أعمدة الصور (حالياً: ${toArabicDigits(picturesColumnCount)} أعمدة)",
             "إظهار كل الألبومات المخفية",
-            "إعادة فحص وتحديث صور الهاتف"
+            "إعادة فحص وتحديث صور الهاتف",
+            "السماح بإدارة الوسائط (حذف بدون نافذة تأكيد)"
         )
         AlertDialog.Builder(this)
             .setTitle("ضبط الاستديو (Samsung One UI)")
@@ -5204,6 +6241,7 @@ class MainActivity : Activity() {
                         requestMediaPermissionsIfNeeded()
                         Toast.makeText(this, "جاري تحديث صور وفيديوهات الهاتف...", Toast.LENGTH_SHORT).show()
                     }
+                    8 -> openManageMediaSettings()
                 }
             }
             .setPositiveButton("إغلاق", null)
@@ -5238,7 +6276,7 @@ class MainActivity : Activity() {
             if (appLockEnabled) "✓ تفعيل قفل الاستديو عند الفتح" else "تفعيل قفل الاستديو عند الفتح",
             "تعيين / تغيير كلمة السر أو رمز PIN",
             if (appLockBiometric) "✓ السماح بفتح القفل ببصمة الإصبع" else "السماح بفتح القفل ببصمة الإصبع",
-            "قفل الاستديو الآن 🔒",
+            "قفل الاستديو الآن",
             if (appLockEnabled) "إيقاف قفل الاستديو" else "إلغاء"
         )
         AlertDialog.Builder(this)
@@ -5322,11 +6360,16 @@ class MainActivity : Activity() {
                     p1.isEmpty() -> {
                         Toast.makeText(this, "يرجى إدخال كلمة سر صالحة", Toast.LENGTH_SHORT).show()
                     }
+                    p1.length < 4 -> {
+                        Toast.makeText(this, "الحد الأدنى لكلمة السر ٤ خانات", Toast.LENGTH_SHORT).show()
+                    }
                     p1 != p2 -> {
                         Toast.makeText(this, "كلمتا السر غير متطابقتين", Toast.LENGTH_SHORT).show()
                     }
                     else -> {
-                        appLockPin = p1
+                        appLockPin = hashPinForStorage(p1)
+                        appLockPinLen = p1.length
+                        resetFailedAttempts()
                         appLockEnabled = true
                         savePersistedState()
                         Toast.makeText(this, "تم حفظ كلمة السر وتفعيل القفل", Toast.LENGTH_SHORT).show()
@@ -5342,6 +6385,17 @@ class MainActivity : Activity() {
 
     private fun lockGalleryNow(autoPromptBiometric: Boolean) {
         isAppLockedNow = true
+        // إيقاف أي تشغيل مفتوح قبل إظهار شاشة القفل
+        if (isSlideshowRunning) stopSlideshow()
+        pauseVideoViewsIn(overlayLayer)
+        pauseVideoViewsIn(floatingPipLayer)
+        try {
+            if (audioPlayer?.isPlaying == true) {
+                audioPlayer?.pause()
+                isAudioPlaying = false
+            }
+        } catch (_: Exception) {
+        }
         renderLockScreenOverlay(autoPromptBiometric)
     }
 
@@ -5359,7 +6413,7 @@ class MainActivity : Activity() {
         lockLayer.visibility = View.VISIBLE
 
         var enteredPin = ""
-        val targetLen = appLockPin.length.coerceAtLeast(4)
+        val targetLen = appLockPinLen.coerceAtLeast(4)
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -5449,16 +6503,26 @@ class MainActivity : Activity() {
         }
 
         fun onDigitPressed(digit: String) {
+            val waitMs = lockoutRemainingMs()
+            if (waitMs > 0L) {
+                statusTv.text = lockoutMessage(waitMs)
+                statusTv.setTextColor(0xFFFF453A.toInt())
+                return
+            }
             if (enteredPin.length < 12) {
                 enteredPin += digit
                 refreshDotsUI(false)
-                if (enteredPin == appLockPin) {
+                if (appLockPinLen > 0 && verifyPinIfComplete(enteredPin)) {
+                    resetFailedAttempts()
                     unlockGalleryNow()
                     return
                 }
-                if (appLockPin.isNotEmpty() && enteredPin.length >= appLockPin.length) {
+                if (appLockPinLen > 0 && enteredPin.length >= appLockPinLen) {
+                    registerFailedAttempt()
+                    try { rootStack.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS) } catch (_: Exception) {}
                     refreshDotsUI(true)
-                    statusTv.text = "رمز الحماية غير صحيح، حاول مرة أخرى"
+                    val remaining = lockoutRemainingMs()
+                    statusTv.text = if (remaining > 0L) lockoutMessage(remaining) else "رمز الحماية غير صحيح، حاول مرة أخرى"
                     statusTv.setTextColor(0xFFFF453A.toInt())
                     dotsRow.translationX = dpF(16f)
                     dotsRow.animate().translationX(0f).setDuration(140L).start()
@@ -5513,7 +6577,7 @@ class MainActivity : Activity() {
                     }
                     "DEL" -> {
                         val delTv = TextView(this).apply {
-                            text = "⌫"
+                            text = "مسح"
                             textSize = 22f
                             setTextColor(Color.WHITE)
                             gravity = Gravity.CENTER
@@ -5554,7 +6618,7 @@ class MainActivity : Activity() {
 
         // خيار فتح لوحة المفاتيح النصية إذا كانت كلمة السر تحتوي على حروف
         val kbBtn = TextView(this).apply {
-            text = "إدخال كلمة سر بالحروف ⌨"
+            text = "إدخال كلمة سر بالحروف "
             textSize = 12.5f
             setTextColor(colorBrandIceBlue)
             gravity = Gravity.CENTER
@@ -5570,9 +6634,14 @@ class MainActivity : Activity() {
                     .setTitle("فتح قفل الاستديو")
                     .setView(input)
                     .setPositiveButton("فتح") { _, _ ->
-                        if (input.text.toString().trim() == appLockPin) {
+                        val waitMs = lockoutRemainingMs()
+                        if (waitMs > 0L) {
+                            statusTv.text = lockoutMessage(waitMs)
+                        } else if (verifyPin(input.text.toString().trim())) {
+                            resetFailedAttempts()
                             unlockGalleryNow()
                         } else {
+                            registerFailedAttempt()
                             statusTv.text = "كلمة السر غير صحيحة"
                         }
                     }
@@ -5602,39 +6671,61 @@ class MainActivity : Activity() {
         currentAudioIndex = safeIdx
         val track = deviceAudioTracks[safeIdx]
 
+        val token = ++audioLoadToken
         try {
             audioPlayer?.stop()
             audioPlayer?.release()
         } catch (_: Exception) {}
+        audioPlayer = null
+        isAudioPlaying = false
+        updateMiniAudioPlayerBar()
 
-        try {
-            val mp = MediaPlayer().apply {
-                setDataSource(this@MainActivity, track.contentUri)
-                prepare()
-                isLooping = isAudioRepeatOne
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && audioSpeed != 1.0f) {
+        Thread {
+            var mp: MediaPlayer? = null
+            try {
+                val player = MediaPlayer()
+                mp = player
+                player.setDataSource(this@MainActivity, track.contentUri)
+                player.prepare()
+                handler.post {
+                    if (token != audioLoadToken || isFinishing) {
+                        try { player.release() } catch (_: Exception) {}
+                        return@post
+                    }
                     try {
-                        playbackParams = (playbackParams ?: PlaybackParams()).setSpeed(audioSpeed)
-                    } catch (_: Exception) {}
-                }
-                setOnCompletionListener {
-                    if (!isAudioRepeatOne) {
-                        val nextIdx = if (isAudioShuffle) {
-                            (Math.random() * deviceAudioTracks.size).toInt()
-                        } else {
-                            currentAudioIndex + 1
+                        player.isLooping = isAudioRepeatOne
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && audioSpeed != 1.0f) {
+                            try {
+                                player.playbackParams = (player.playbackParams ?: PlaybackParams()).setSpeed(audioSpeed)
+                            } catch (_: Exception) {}
                         }
-                        playAudioTrackAtIndex(nextIdx)
+                        player.setOnCompletionListener {
+                            if (!isAudioRepeatOne) {
+                                val nextIdx = if (isAudioShuffle) {
+                                    (Math.random() * deviceAudioTracks.size).toInt()
+                                } else {
+                                    currentAudioIndex + 1
+                                }
+                                playAudioTrackAtIndex(nextIdx)
+                            }
+                        }
+                        player.start()
+                        audioPlayer = player
+                        isAudioPlaying = true
+                        updateMiniAudioPlayerBar()
+                    } catch (_: Exception) {
+                        try { player.release() } catch (_: Exception) {}
                     }
                 }
-                start()
+            } catch (_: Exception) {
+                try { mp?.release() } catch (_: Exception) {}
+                handler.post {
+                    if (token == audioLoadToken) {
+                        Toast.makeText(this@MainActivity, "تعذر تشغيل المقطع الصوتي", Toast.LENGTH_SHORT).show()
+                    }
+                }
             }
-            audioPlayer = mp
-            isAudioPlaying = true
-            updateMiniAudioPlayerBar()
-        } catch (e: Exception) {
-            Toast.makeText(this, "تعذر تشغيل المقطع الصوتي", Toast.LENGTH_SHORT).show()
-        }
+        }.start()
     }
 
     private fun updateMiniAudioPlayerBar() {
@@ -5670,33 +6761,24 @@ class MainActivity : Activity() {
         }
         miniAudioPlayerBar.addView(closeMiniBtn)
 
-        val nextBtn = TextView(this).apply {
-            text = "⏮"
-            textSize = 16f
-            setTextColor(Color.WHITE)
-            setPadding(dp(8), dp(4), dp(8), dp(4))
-            setOnClickListener { playAudioTrackAtIndex(currentAudioIndex + 1) }
+        val nextBtn = makeCircleIconBtn(SamsungIconView.IconType.SKIP_NEXT, 32, 15, 0x22FFFFFF) {
+            playAudioTrackAtIndex(currentAudioIndex + 1)
         }
-        miniAudioPlayerBar.addView(nextBtn)
+        miniAudioPlayerBar.addView(nextBtn, LinearLayout.LayoutParams(dp(32), dp(32)).apply { leftMargin = dp(6) })
 
-        val playPauseMini = TextView(this).apply {
-            text = if (audioPlayer?.isPlaying == true) "⏸" else "▶"
-            textSize = 17f
-            setTextColor(colorBrandIceBlue)
-            setPadding(dp(10), dp(4), dp(10), dp(4))
-            setOnClickListener {
-                val mp = audioPlayer ?: return@setOnClickListener
-                if (mp.isPlaying) {
-                    mp.pause()
-                    isAudioPlaying = false
-                } else {
-                    mp.start()
-                    isAudioPlaying = true
-                }
-                updateMiniAudioPlayerBar()
+        val miniIc = if (audioPlayer?.isPlaying == true) SamsungIconView.IconType.PAUSE_SOLID else SamsungIconView.IconType.PLAY_SOLID
+        val playPauseMini = makeCircleIconBtn(miniIc, 34, 16, colorSamsungBlue) {
+            val mp = audioPlayer ?: return@makeCircleIconBtn
+            if (mp.isPlaying) {
+                mp.pause()
+                isAudioPlaying = false
+            } else {
+                mp.start()
+                isAudioPlaying = true
             }
+            updateMiniAudioPlayerBar()
         }
-        miniAudioPlayerBar.addView(playPauseMini)
+        miniAudioPlayerBar.addView(playPauseMini, LinearLayout.LayoutParams(dp(34), dp(34)).apply { leftMargin = dp(6) })
 
         val infoCol = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -5903,12 +6985,8 @@ class MainActivity : Activity() {
             layoutDirection = View.LAYOUT_DIRECTION_LTR
         }
 
-        val playMainBtn = TextView(this).apply {
-            text = if (audioPlayer?.isPlaying == true) "⏸" else "▶"
-            textSize = 20f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Color.WHITE)
-            gravity = Gravity.CENTER
+        val playMainBtn = FrameLayout(this).apply {
+            isClickable = true
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
                 setColor(colorSamsungBlue)
@@ -5920,19 +6998,24 @@ class MainActivity : Activity() {
             activeTitleTv.text = tr?.title ?: "اختر مقطعاً صوتياً للتشغيل"
             activeArtistTv.text = tr?.let { "${it.artist} • ${it.album}" } ?: "استديو الصوتيات"
             totAudioTimeTv.text = tr?.durationText ?: "٠:٠٠"
-            playMainBtn.text = if (audioPlayer?.isPlaying == true) "⏸" else "▶"
+            playMainBtn.removeAllViews()
+            val pIc = if (audioPlayer?.isPlaying == true) SamsungIconView.IconType.PAUSE_SOLID else SamsungIconView.IconType.PLAY_SOLID
+            playMainBtn.addView(
+                SamsungIconView(this@MainActivity, pIc, Color.WHITE, 2.0f),
+                FrameLayout.LayoutParams(dp(22), dp(22)).apply { gravity = Gravity.CENTER }
+            )
             visualizerView.isAnimatingWaves = (audioPlayer?.isPlaying == true)
             visualizerView.invalidate()
         }
 
-        val repeatBtn = makeVideoPillButton(if (isAudioRepeatOne) "🔂 واحد" else "🔁 الكل") {}
+        val repeatBtn = makeVideoPillButton(if (isAudioRepeatOne) "تكرار ١" else "تكرار الكل") {}
         repeatBtn.setOnClickListener {
             isAudioRepeatOne = !isAudioRepeatOne
             audioPlayer?.isLooping = isAudioRepeatOne
-            repeatBtn.text = if (isAudioRepeatOne) "🔂 واحد" else "🔁 الكل"
+            repeatBtn.text = if (isAudioRepeatOne) "تكرار ١" else "تكرار الكل"
         }
 
-        val prevTrackBtn = makeVideoPillButton("⏮") {
+        val prevTrackBtn = makeCircleIconBtn(SamsungIconView.IconType.SKIP_PREV, 38, 18, 0xFF282830.toInt()) {
             if (deviceAudioTracks.isNotEmpty()) {
                 playAudioTrackAtIndex(if (currentAudioIndex <= 0) deviceAudioTracks.size - 1 else currentAudioIndex - 1)
                 refreshAudioDeckUI()
@@ -5965,17 +7048,17 @@ class MainActivity : Activity() {
             audioPlayer?.let { mp -> mp.seekTo((mp.currentPosition + 10_000).coerceAtMost(mp.duration)) }
         }
 
-        val nextTrackBtn = makeVideoPillButton("⏭") {
+        val nextTrackBtn = makeCircleIconBtn(SamsungIconView.IconType.SKIP_NEXT, 38, 18, 0xFF282830.toInt()) {
             if (deviceAudioTracks.isNotEmpty()) {
                 playAudioTrackAtIndex(currentAudioIndex + 1)
                 refreshAudioDeckUI()
             }
         }
 
-        val shuffleBtn = makeVideoPillButton(if (isAudioShuffle) "🔀 مفعّل" else "🔀") {}
+        val shuffleBtn = makeVideoPillButton(if (isAudioShuffle) "مفعّل" else "عشوائي") {}
         shuffleBtn.setOnClickListener {
             isAudioShuffle = !isAudioShuffle
-            shuffleBtn.text = if (isAudioShuffle) "🔀 مفعّل" else "🔀"
+            shuffleBtn.text = if (isAudioShuffle) "مفعّل" else "عشوائي"
         }
 
         transportRow.addView(repeatBtn, LinearLayout.LayoutParams(0, dp(36), 1f).apply { rightMargin = dp(4) })
@@ -6074,6 +7157,7 @@ class MainActivity : Activity() {
                 dividerHeight = dp(6)
                 selector = ColorDrawable(Color.TRANSPARENT)
                 isFastScrollEnabled = true
+            verticalScrollbarPosition = View.SCROLLBAR_POSITION_RIGHT
             }
             root.addView(listView, LinearLayout.LayoutParams(-1, 0, 1f))
         }
@@ -6121,6 +7205,7 @@ class MainActivity : Activity() {
                             super.onAuthenticationSucceeded(result)
                             handler.post {
                                 Toast.makeText(this@MainActivity, "تم التحقق من البصمة بنجاح", Toast.LENGTH_SHORT).show()
+                                resetFailedAttempts()
                                 unlockGalleryNow()
                             }
                         }
@@ -6207,7 +7292,7 @@ class MainActivity : Activity() {
                     putParcelableArrayListExtra(Intent.EXTRA_STREAM, selectedUris)
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 }
-                startActivity(Intent.createChooser(intent, "مشاركة عبر"))
+                markExternalLaunch(); startActivity(Intent.createChooser(intent, "مشاركة عبر"))
             } catch (_: Exception) {
             }
         }
@@ -6220,7 +7305,7 @@ class MainActivity : Activity() {
                 putExtra(Intent.EXTRA_STREAM, media.contentUri)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
-            startActivity(Intent.createChooser(intent, "مشاركة عبر"))
+            markExternalLaunch(); startActivity(Intent.createChooser(intent, "مشاركة عبر"))
         } catch (_: Exception) {
             Toast.makeText(this, "مشاركة: ${media.title}", Toast.LENGTH_SHORT).show()
         }
@@ -6257,6 +7342,8 @@ class MainActivity : Activity() {
                 )
                 if (bmp != null) return bmp
             }
+        } catch (_: OutOfMemoryError) {
+            bitmapCache.evictAll()
         } catch (_: Exception) {
         }
 
@@ -6415,23 +7502,47 @@ class MainActivity : Activity() {
     /**
      * عارض الصور التفاعلي الفوري بأعلى دقة (QHD/4K + EXIF + Pinch-to-Zoom + Double-Tap + Swipe)
      */
+    /**
+     * عارض الصور التفاعلي المتصل بستايل سامسونج (1000036342.png):
+     * - عند السحب بإصبع واحد أفقياً، تتحرك الصورة الحالية مع إصبعك لحظة بلحظة وتظهر الصورة المجاورة بجانبها
+     *   مباشرة مع فاصل أسود عمودي (Black Divider Gap) بين الصورتين تماماً مثل استديو سامسونج!
+     * - عند إفلات الإصبع، يكمل الأنيميشن انتقال الصورة بسلاسة فائقة (ValueAnimator 160ms).
+     * - يدعم التكبير بإصبعين (Pinch-to-Zoom) والنقر المزدوج والتحريك في كافة الاتجاهات.
+     */
     private inner class TouchZoomableImageView(
         context: Context,
-        initialMedia: MediaItem,
+        private val mediaList: List<MediaItem>,
+        initialIndex: Int,
         private val onSingleTap: () -> Unit,
-        private val onSwipeNext: () -> Unit,
-        private val onSwipePrev: () -> Unit,
-        private val onSwipeUpDetails: () -> Unit
+        private val onIndexCommitted: (Int) -> Unit,
+        private val onSwipeUpDetails: () -> Unit,
+        private val onDismissRequest: () -> Unit = {}
     ) : View(context) {
 
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG)
+        private val gapPaint = Paint().apply { color = Color.BLACK }
         private val matrixDraw = Matrix()
-        private var currentMedia: MediaItem = initialMedia
-        private var highResBmp: Bitmap? = null
+
+        private var activeIndex = initialIndex.coerceIn(0, (mediaList.size - 1).coerceAtLeast(0))
+        private var currentBmp: Bitmap? = null
+        private var prevBmp: Bitmap? = null
+        private var nextBmp: Bitmap? = null
 
         private var scaleFactor = 1f
         private var transX = 0f
         private var transY = 0f
+
+        // إزاحة السحب الأفقي المتصل بين الصورتين مع الفاصل الأسود (1000036342.png)
+        private var pagerDragOffsetX = 0f
+        private var isDraggingPager = false
+        private var isAnimatingPager = false
+        private var dismissDragY = 0f
+        private var isDraggingDismiss = false
+        private var isDismissing = false
+        private val pageGapPx = dpF(18f)
+
+        private var downX = 0f
+        private var downY = 0f
         private var lastTouchX = 0f
         private var lastTouchY = 0f
         private var activePointerId = MotionEvent.INVALID_POINTER_ID
@@ -6439,6 +7550,12 @@ class MainActivity : Activity() {
         private val scaleDetector = ScaleGestureDetector(
             context,
             object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
+                    isDraggingPager = false
+                    pagerDragOffsetX = 0f
+                    return true
+                }
+
                 override fun onScale(detector: ScaleGestureDetector): Boolean {
                     val prevScale = scaleFactor
                     scaleFactor = (scaleFactor * detector.scaleFactor).coerceIn(1f, 6f)
@@ -6462,21 +7579,24 @@ class MainActivity : Activity() {
             context,
             object : GestureDetector.SimpleOnGestureListener() {
                 override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
-                    onSingleTap()
+                    if (!isAnimatingPager && abs(pagerDragOffsetX) < dp(6)) {
+                        onSingleTap()
+                    }
                     return true
                 }
 
                 override fun onDoubleTap(e: MotionEvent): Boolean {
+                    if (isAnimatingPager) return true
+                    pagerDragOffsetX = 0f
+                    isDraggingPager = false
                     if (scaleFactor > 1.05f) {
-                        scaleFactor = 1f
-                        transX = 0f
-                        transY = 0f
+                        animateZoomTo(1f, 0f, 0f)
                     } else {
-                        scaleFactor = 2.8f
-                        transX = (width * 0.5f - e.x) * 1.5f
-                        transY = (height * 0.5f - e.y) * 1.5f
+                        val targetScale = 2.8f
+                        val tx = (width * 0.5f - e.x) * 1.5f
+                        val ty = (height * 0.5f - e.y) * 1.5f
+                        animateZoomTo(targetScale, tx, ty)
                     }
-                    invalidate()
                     return true
                 }
 
@@ -6486,18 +7606,23 @@ class MainActivity : Activity() {
                     velocityX: Float,
                     velocityY: Float
                 ): Boolean {
-                    if (e1 == null || scaleFactor > 1.15f) return false
+                    if (e1 == null || scaleFactor > 1.05f || isAnimatingPager) return false
                     val dx = e2.x - e1.x
                     val dy = e2.y - e1.y
-                    if (abs(dx) > abs(dy) && abs(dx) > dp(55) && abs(velocityX) > 200f) {
-                        if (dx < 0) {
-                            onSwipeNext()
-                        } else {
-                            onSwipePrev()
+                    if (abs(dx) > abs(dy) && abs(velocityX) > 450f) {
+                        // اتجاه التقليب معكوس: السحب لليمين = الصورة التالية، لليسار = السابقة
+                        if (dx > 0 && activeIndex < mediaList.size - 1) {
+                            settlePagerTo(+1)
+                            return true
+                        } else if (dx < 0 && activeIndex > 0) {
+                            settlePagerTo(-1)
+                            return true
                         }
-                        return true
-                    } else if (dy < -dp(80) && abs(dy) > abs(dx)) {
+                    } else if (dy < -dp(90) && abs(dy) > abs(dx) * 1.5f && abs(pagerDragOffsetX) < dp(20)) {
                         onSwipeUpDetails()
+                        return true
+                    } else if (dy > dp(90) && abs(dy) > abs(dx) * 1.5f && velocityY > 900f) {
+                        animateDismiss()
                         return true
                     }
                     return false
@@ -6506,89 +7631,334 @@ class MainActivity : Activity() {
         )
 
         init {
-            setMediaItem(initialMedia)
+            loadCurrentAndNeighbors()
         }
 
-        fun setMediaItem(newMedia: MediaItem) {
-            currentMedia = newMedia
-            scaleFactor = 1f
-            transX = 0f
-            transY = 0f
-            val fullCacheKey = "${newMedia.id}_full2560"
-            val cachedFull = bitmapCache.get(fullCacheKey)
-            if (cachedFull != null && !cachedFull.isRecycled) {
-                highResBmp = cachedFull
-                invalidate()
-            } else {
-                highResBmp = bitmapCache.get("${newMedia.id}_640")
-                    ?: bitmapCache.get("${newMedia.id}_480")
-                invalidate()
-                val targetId = newMedia.id
-                // فك الصورة بدقة الشاشة الكاملة على المحرك الفوري المستقل (viewerExecutor) بدون انتظار الشبكة!
-                viewerExecutor.execute {
-                    val decoded = decodeFullResolutionWithExif(newMedia, 2560)
-                    if (decoded != null) {
-                        bitmapCache.put(fullCacheKey, decoded)
-                        if (currentMedia.id == targetId) {
-                            highResBmp = decoded
-                            postInvalidate()
-                        }
+        fun syncIndexIfNeeded(newIndex: Int) {
+            if (newIndex != activeIndex && newIndex in mediaList.indices) {
+                activeIndex = newIndex
+                scaleFactor = 1f
+                transX = 0f
+                transY = 0f
+                pagerDragOffsetX = 0f
+                loadCurrentAndNeighbors()
+            }
+        }
+
+        private fun animateZoomTo(targetScale: Float, targetTx: Float, targetTy: Float) {
+            val startScale = scaleFactor
+            val startTx = transX
+            val startTy = transY
+            ValueAnimator.ofFloat(0f, 1f).apply {
+                duration = 165L
+                interpolator = smoothInterpolator
+                addUpdateListener { anim ->
+                    val f = anim.animatedValue as Float
+                    scaleFactor = startScale + (targetScale - startScale) * f
+                    transX = startTx + (targetTx - startTx) * f
+                    transY = startTy + (targetTy - startTy) * f
+                    invalidate()
+                }
+                start()
+            }
+        }
+
+        private fun loadCurrentAndNeighbors() {
+            if (mediaList.isEmpty()) return
+            val curr = mediaList[activeIndex]
+            currentBmp = getQuickOrCachedBitmap(curr)
+            prevBmp = mediaList.getOrNull(activeIndex - 1)?.let { getQuickOrCachedBitmap(it) }
+            nextBmp = mediaList.getOrNull(activeIndex + 1)?.let { getQuickOrCachedBitmap(it) }
+            invalidate()
+
+            val expectedIdx = activeIndex
+            viewerExecutor.execute {
+                val fullCurr = getOrDecodeHighRes(curr)
+                if (activeIndex == expectedIdx && fullCurr != null) {
+                    currentBmp = fullCurr
+                    postInvalidate()
+                }
+                mediaList.getOrNull(expectedIdx + 1)?.let { nxt ->
+                    val b = getOrDecodeHighRes(nxt)
+                    if (activeIndex == expectedIdx && b != null) {
+                        nextBmp = b
+                    }
+                }
+                mediaList.getOrNull(expectedIdx - 1)?.let { prv ->
+                    val b = getOrDecodeHighRes(prv)
+                    if (activeIndex == expectedIdx && b != null) {
+                        prevBmp = b
                     }
                 }
             }
+        }
+
+        private fun getQuickOrCachedBitmap(media: MediaItem): Bitmap? {
+            return bitmapCache.get("${media.id}_full2560")
+                ?: bitmapCache.get("${media.id}_1024")
+                ?: bitmapCache.get("${media.id}_640")
+                ?: bitmapCache.get("${media.id}_480")
+        }
+
+        private fun getOrDecodeHighRes(media: MediaItem): Bitmap? {
+            val fullKey = "${media.id}_full2560"
+            bitmapCache.get(fullKey)?.let { if (!it.isRecycled) return it }
+            val decoded = decodeFullResolutionWithExif(media, 2560)
+            if (decoded != null) {
+                bitmapCache.put(fullKey, decoded)
+            }
+            return decoded
+        }
+
+        private fun drawSingleBitmapFitted(
+            canvas: Canvas,
+            bmp: Bitmap?,
+            fallbackMedia: MediaItem?,
+            offsetX: Float,
+            scale: Float,
+            panX: Float,
+            panY: Float
+        ) {
+            val w = width.toFloat()
+            val h = height.toFloat()
+            val validBmp = if (bmp != null && !bmp.isRecycled) {
+                bmp
+            } else if (fallbackMedia != null) {
+                requestThumbnailAsync(fallbackMedia, 900, this)
+            } else {
+                null
+            } ?: return
+
+            val bw = validBmp.width.toFloat().coerceAtLeast(1f)
+            val bh = validBmp.height.toFloat().coerceAtLeast(1f)
+            val baseScale = min(w / bw, h / bh)
+
+            matrixDraw.reset()
+            matrixDraw.postTranslate(-bw * 0.5f, -bh * 0.5f)
+            matrixDraw.postScale(baseScale * scale, baseScale * scale)
+            matrixDraw.postTranslate(w * 0.5f + panX + offsetX, h * 0.5f + panY)
+            canvas.drawBitmap(validBmp, matrixDraw, paint)
         }
 
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
             val w = width.toFloat()
             val h = height.toFloat()
-            if (w <= 0f || h <= 0f) return
+            if (w <= 0f || h <= 0f || mediaList.isEmpty()) return
 
-            val bmp = highResBmp ?: requestThumbnailAsync(currentMedia, 900, this)
-            if (bmp == null || bmp.isRecycled) return
+            val dragProgress = (abs(pagerDragOffsetX) / w).coerceIn(0f, 1f)
+            val dismissProgress = (dismissDragY / (h * 0.6f)).coerceIn(0f, 1f)
+            val depthScale = if (scaleFactor <= 1.04f) 1f - 0.06f * dragProgress else 1f
+            val dismissScale = 1f - 0.28f * dismissProgress
 
-            val bw = bmp.width.toFloat().coerceAtLeast(1f)
-            val bh = bmp.height.toFloat().coerceAtLeast(1f)
-            val baseScale = min(w / bw, h / bh)
+            // 1. الصورة الحالية (مع تأثير العمق أثناء السحب وتأثير الإغلاق بالسحب للأسفل)
+            drawSingleBitmapFitted(
+                canvas = canvas,
+                bmp = currentBmp,
+                fallbackMedia = mediaList[activeIndex],
+                offsetX = pagerDragOffsetX,
+                scale = scaleFactor * depthScale * dismissScale,
+                panX = transX,
+                panY = transY + dismissDragY
+            )
 
-            matrixDraw.reset()
-            matrixDraw.postTranslate(-bw * 0.5f, -bh * 0.5f)
-            matrixDraw.postScale(baseScale * scaleFactor, baseScale * scaleFactor)
-            matrixDraw.postTranslate(w * 0.5f + transX, h * 0.5f + transY)
+            // 2. الصورة المجاورة — الاتجاه معكوس: السحب لليسار يُظهر السابقة من اليمين، والسحب لليمين يُظهر التالية من اليسار
+            if (pagerDragOffsetX < -1f && activeIndex > 0) {
+                val gapLeft = w + pagerDragOffsetX
+                canvas.drawRect(gapLeft, 0f, gapLeft + pageGapPx, h, gapPaint)
+                val prevOffsetX = pagerDragOffsetX + w + pageGapPx
+                drawSingleBitmapFitted(
+                    canvas = canvas,
+                    bmp = prevBmp,
+                    fallbackMedia = mediaList[activeIndex - 1],
+                    offsetX = prevOffsetX,
+                    scale = 0.94f + 0.06f * dragProgress,
+                    panX = 0f,
+                    panY = 0f
+                )
+            } else if (pagerDragOffsetX > 1f && activeIndex < mediaList.size - 1) {
+                val gapRight = pagerDragOffsetX
+                canvas.drawRect(gapRight - pageGapPx, 0f, gapRight, h, gapPaint)
+                val nextOffsetX = pagerDragOffsetX - w - pageGapPx
+                drawSingleBitmapFitted(
+                    canvas = canvas,
+                    bmp = nextBmp,
+                    fallbackMedia = mediaList[activeIndex + 1],
+                    offsetX = nextOffsetX,
+                    scale = 0.94f + 0.06f * dragProgress,
+                    panX = 0f,
+                    panY = 0f
+                )
+            }
+        }
 
-            canvas.drawBitmap(bmp, matrixDraw, paint)
+        private fun settlePagerTo(direction: Int) {
+            // direction: -1 = السحب لليسار (الصورة السابقة)، +1 = السحب لليمين (الصورة التالية)، 0 = رجوع للمركز
+            val w = width.toFloat().coerceAtLeast(1f)
+            val targetOffset = when (direction) {
+                -1 -> -(w + pageGapPx)
+                +1 -> +(w + pageGapPx)
+                else -> 0f
+            }
+            val startOffset = pagerDragOffsetX
+            isAnimatingPager = true
+            isDraggingPager = false
+
+            ValueAnimator.ofFloat(startOffset, targetOffset).apply {
+                duration = 230L
+                interpolator = DecelerateInterpolator(1.5f)
+                addUpdateListener { anim ->
+                    pagerDragOffsetX = anim.animatedValue as Float
+                    invalidate()
+                }
+                addListener(object : AnimatorListenerAdapter() {
+                    override fun onAnimationEnd(animation: Animator) {
+                        isAnimatingPager = false
+                        pagerDragOffsetX = 0f
+                        if (direction == -1 && activeIndex > 0) {
+                            activeIndex--
+                            nextBmp = currentBmp
+                            currentBmp = prevBmp
+                            prevBmp = null
+                            onIndexCommitted(activeIndex)
+                            loadCurrentAndNeighbors()
+                        } else if (direction == +1 && activeIndex < mediaList.size - 1) {
+                            activeIndex++
+                            prevBmp = currentBmp
+                            currentBmp = nextBmp
+                            nextBmp = null
+                            onIndexCommitted(activeIndex)
+                            loadCurrentAndNeighbors()
+                        } else {
+                            invalidate()
+                        }
+                    }
+                })
+                start()
+            }
+        }
+
+        private fun animateDismiss() {
+            if (isDismissing) return
+            isDismissing = true
+            isDraggingDismiss = false
+            ValueAnimator.ofFloat(dismissDragY, height.toFloat().coerceAtLeast(1f)).apply {
+                duration = 200L
+                interpolator = DecelerateInterpolator(1.2f)
+                addUpdateListener { a ->
+                    dismissDragY = a.animatedValue as Float
+                    invalidate()
+                }
+                addListener(object : AnimatorListenerAdapter() {
+                    override fun onAnimationEnd(animation: Animator) {
+                        onDismissRequest()
+                    }
+                })
+                start()
+            }
+        }
+
+        private fun animateDismissBack() {
+            ValueAnimator.ofFloat(dismissDragY, 0f).apply {
+                duration = 180L
+                interpolator = smoothInterpolator
+                addUpdateListener { a ->
+                    dismissDragY = a.animatedValue as Float
+                    invalidate()
+                }
+                start()
+            }
         }
 
         override fun onTouchEvent(event: MotionEvent): Boolean {
             scaleDetector.onTouchEvent(event)
             gestureDetector.onTouchEvent(event)
 
+            if (isAnimatingPager || isDismissing) return true
+
+            if (event.pointerCount > 1) {
+                if (isDraggingPager) {
+                    isDraggingPager = false
+                    pagerDragOffsetX = 0f
+                    invalidate()
+                }
+                if (isDraggingDismiss) {
+                    isDraggingDismiss = false
+                    dismissDragY = 0f
+                    invalidate()
+                }
+            }
+
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
+                    downX = event.x
+                    downY = event.y
                     lastTouchX = event.x
                     lastTouchY = event.y
                     activePointerId = event.getPointerId(0)
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    if (!scaleDetector.isInProgress && scaleFactor > 1.02f) {
+                    if (!scaleDetector.isInProgress && event.pointerCount == 1) {
                         val idx = event.findPointerIndex(activePointerId)
                         if (idx >= 0) {
                             val x = event.getX(idx)
                             val y = event.getY(idx)
-                            transX += (x - lastTouchX)
-                            transY += (y - lastTouchY)
-                            val maxPanX = width * (scaleFactor - 1f) * 0.55f
-                            val maxPanY = height * (scaleFactor - 1f) * 0.55f
-                            transX = transX.coerceIn(-maxPanX, maxPanX)
-                            transY = transY.coerceIn(-maxPanY, maxPanY)
+                            val dx = x - lastTouchX
+                            val dy = y - lastTouchY
+
+                            if (scaleFactor > 1.04f) {
+                                // تحريك داخل الصورة المكبرة
+                                transX += dx
+                                transY += dy
+                                val maxPanX = width * (scaleFactor - 1f) * 0.55f
+                                val maxPanY = height * (scaleFactor - 1f) * 0.55f
+                                transX = transX.coerceIn(-maxPanX, maxPanX)
+                                transY = transY.coerceIn(-maxPanY, maxPanY)
+                                invalidate()
+                            } else {
+                                // سحب متصل بين الصورتين مع الفاصل الأسود (1000036342.png)
+                                val totalDx = x - downX
+                                val totalDy = y - downY
+                                if (!isDraggingPager && !isDraggingDismiss && totalDy > dp(12) && totalDy > abs(totalDx) * 1.6f) {
+                                    isDraggingDismiss = true
+                                }
+                                if (isDraggingDismiss) {
+                                    dismissDragY = totalDy.coerceAtLeast(0f)
+                                    invalidate()
+                                } else if (!isDraggingPager && abs(totalDx) > dp(8) && abs(totalDx) > abs(totalDy) * 1.15f) {
+                                    isDraggingPager = true
+                                }
+                                if (isDraggingPager) {
+                                    var nextOffset = pagerDragOffsetX + dx
+                                    if (nextOffset > 0f && activeIndex >= mediaList.size - 1) {
+                                        nextOffset *= 0.25f // مقاومة مرنة عند آخر صورة
+                                    } else if (nextOffset < 0f && activeIndex == 0) {
+                                        nextOffset *= 0.25f // مقاومة مرنة عند أول صورة
+                                    }
+                                    pagerDragOffsetX = nextOffset
+                                    invalidate()
+                                }
+                            }
                             lastTouchX = x
                             lastTouchY = y
-                            invalidate()
                         }
                     }
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     activePointerId = MotionEvent.INVALID_POINTER_ID
+                    if (isDraggingDismiss) {
+                        isDraggingDismiss = false
+                        if (dismissDragY > height * 0.18f) animateDismiss() else animateDismissBack()
+                    } else if (isDraggingPager && !isAnimatingPager) {
+                        val threshold = width * 0.20f
+                        when {
+                            pagerDragOffsetX < -threshold && activeIndex > 0 -> settlePagerTo(-1)
+                            pagerDragOffsetX > threshold && activeIndex < mediaList.size - 1 -> settlePagerTo(+1)
+                            else -> settlePagerTo(0)
+                        }
+                    } else if (abs(pagerDragOffsetX) > 0.5f && !isAnimatingPager) {
+                        settlePagerTo(0)
+                    }
                 }
                 MotionEvent.ACTION_POINTER_UP -> {
                     val pointerIndex = event.actionIndex
@@ -7518,6 +8888,84 @@ class MainActivity : Activity() {
     }
 
     /**
+     * كبسولة مستوى الصوت العمودية المطابقة للصورة 1000036341.png
+     * (حواف مستديرة رمادية داكنة + ثلاث نقاط في الأعلى + شريط الامتلاء العمودي + أيقونة النغمة والسماعة في الأسفل)
+     */
+    private inner class VerticalVolumeBarView(
+        context: Context,
+        var levelPercent: Int
+    ) : View(context) {
+
+        private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xCC48484A.toInt()
+            style = Paint.Style.FILL
+        }
+        private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            style = Paint.Style.FILL
+        }
+        private val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            style = Paint.Style.STROKE
+            strokeWidth = dpF(1.7f)
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+        }
+        private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            style = Paint.Style.FILL
+        }
+        private val rectF = RectF()
+        private val fillRect = RectF()
+        private val clipPath = Path()
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val w = width.toFloat()
+            val h = height.toFloat()
+            if (w <= 0f || h <= 0f) return
+
+            val r = w * 0.5f
+            rectF.set(0f, 0f, w, h)
+            clipPath.reset()
+            clipPath.addRoundRect(rectF, r, r, Path.Direction.CW)
+
+            canvas.save()
+            canvas.clipPath(clipPath)
+            canvas.drawRect(rectF, bgPaint)
+
+            // شريط الامتلاء من الأسفل للأعلى حسب نسبة الصوت
+            val trackTop = dpF(32f)
+            val trackBottom = h - dpF(38f)
+            val trackH = (trackBottom - trackTop).coerceAtLeast(1f)
+            val fillTop = trackBottom - (levelPercent.coerceIn(0, 100) / 100f) * trackH
+            fillRect.set(w * 0.35f, fillTop, w * 0.65f, trackBottom)
+            canvas.drawRoundRect(fillRect, dpF(6f), dpF(6f), fillPaint)
+
+            // الثلاث نقاط الأفقية في أعلى الكبسولة (•••) كما في 1000036341.png
+            val dotY = dpF(16f)
+            val dotR = dpF(1.8f)
+            canvas.drawCircle(w * 0.34f, dotY, dotR, dotPaint)
+            canvas.drawCircle(w * 0.50f, dotY, dotR, dotPaint)
+            canvas.drawCircle(w * 0.66f, dotY, dotR, dotPaint)
+
+            // أيقونة النغمة الموسيقية والموجات الصوتية في أسفل الكبسولة ())) كما في 1000036341.png
+            val by = h - dpF(18f)
+            val bx = w * 0.42f
+            canvas.drawCircle(bx - dpF(2f), by + dpF(3f), dpF(2.8f), iconPaint)
+            canvas.drawLine(bx + dpF(0.8f), by + dpF(3f), bx + dpF(0.8f), by - dpF(6f), iconPaint)
+            canvas.drawLine(bx + dpF(0.8f), by - dpF(6f), bx + dpF(4.5f), by - dpF(4f), iconPaint)
+
+            rectF.set(bx + dpF(2f), by - dpF(5f), bx + dpF(8f), by + dpF(5f))
+            canvas.drawArc(rectF, -45f, 90f, false, iconPaint)
+            rectF.set(bx + dpF(4f), by - dpF(8f), bx + dpF(12f), by + dpF(8f))
+            canvas.drawArc(rectF, -45f, 90f, false, iconPaint)
+
+            canvas.restore()
+        }
+    }
+
+    /**
      * أيقونات المتجهات المرسومة بدقة (Samsung One UI Vector Icons)
      */
     class SamsungIconView(
@@ -7564,7 +9012,47 @@ class MainActivity : Activity() {
             ERASER_BOX,
             LASSO_SCISSORS,
             EYEDROPPER,
-            PALETTE_MIX
+            PALETTE_MIX,
+            INFO_CIRCLE,
+            CHEVRON_RIGHT,
+            ROTATE_PHONE,
+            SPEAKER_ON,
+            SPEAKER_MUTE,
+            PLAY_SOLID,
+            PAUSE_SOLID,
+            SKIP_PREV,
+            SKIP_NEXT,
+            CAPTURE_FRAME,
+            GIF_BADGE,
+            ASPECT_FIT,
+            PIP_WINDOW
+        }
+
+        init {
+            contentDescription = when (iconType) {
+                IconType.SEARCH -> "بحث"
+                IconType.MORE_VERT -> "المزيد"
+                IconType.PLUS -> "إضافة"
+                IconType.HEART, IconType.HEART_FILLED -> "المفضلة"
+                IconType.HAMBURGER -> "القائمة"
+                IconType.TRASH -> "حذف"
+                IconType.SETTINGS -> "الضبط"
+                IconType.SHARE -> "مشاركة"
+                IconType.EDIT_PEN -> "تعديل"
+                IconType.LOCK -> "قفل الاستديو"
+                IconType.FINGERPRINT -> "البصمة"
+                IconType.INFO_CIRCLE -> "تفاصيل"
+                IconType.CHEVRON_RIGHT -> "رجوع"
+                IconType.SPEAKER_ON -> "تشغيل الصوت"
+                IconType.SPEAKER_MUTE -> "كتم الصوت"
+                IconType.PLAY_SOLID, IconType.VIDEO_PLAY -> "تشغيل"
+                IconType.PAUSE_SOLID -> "إيقاف مؤقت"
+                IconType.SKIP_PREV -> "السابق"
+                IconType.SKIP_NEXT -> "التالي"
+                IconType.UNDO_CURVE -> "تراجع"
+                IconType.REDO_CURVE -> "إعادة"
+                else -> null
+            }
         }
 
         private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -7879,6 +9367,121 @@ class MainActivity : Activity() {
                     canvas.drawCircle(cx - r * 0.32f, cy - r * 0.25f, r * 0.12f, fillPaint)
                     canvas.drawCircle(cx + r * 0.25f, cy - r * 0.32f, r * 0.12f, fillPaint)
                     canvas.drawCircle(cx + r * 0.35f, cy + r * 0.2f, r * 0.12f, fillPaint)
+                }
+                IconType.INFO_CIRCLE -> {
+                    canvas.drawCircle(cx, cy, r * 0.88f, strokePaint)
+                    canvas.drawCircle(cx, cy - r * 0.38f, r * 0.09f, fillPaint)
+                    canvas.drawLine(cx, cy - r * 0.08f, cx, cy + r * 0.48f, strokePaint)
+                }
+                IconType.CHEVRON_RIGHT -> {
+                    canvas.drawLine(cx - r * 0.28f, cy - r * 0.72f, cx + r * 0.42f, cy, strokePaint)
+                    canvas.drawLine(cx + r * 0.42f, cy, cx - r * 0.28f, cy + r * 0.72f, strokePaint)
+                }
+                IconType.ROTATE_PHONE -> {
+                    canvas.save()
+                    canvas.rotate(-28f, cx, cy)
+                    rect.set(cx - r * 0.36f, cy - r * 0.62f, cx + r * 0.36f, cy + r * 0.62f)
+                    canvas.drawRoundRect(rect, r * 0.14f, r * 0.14f, strokePaint)
+                    canvas.restore()
+                    rect.set(cx - r * 0.9f, cy - r * 0.9f, cx + r * 0.9f, cy + r * 0.9f)
+                    canvas.drawArc(rect, -70f, 110f, false, strokePaint)
+                    canvas.drawArc(rect, 110f, 110f, false, strokePaint)
+                }
+                IconType.SPEAKER_ON, IconType.SPEAKER_MUTE -> {
+                    path.moveTo(cx - r * 0.75f, cy - r * 0.3f)
+                    path.lineTo(cx - r * 0.35f, cy - r * 0.3f)
+                    path.lineTo(cx + r * 0.15f, cy - r * 0.75f)
+                    path.lineTo(cx + r * 0.15f, cy + r * 0.75f)
+                    path.lineTo(cx - r * 0.35f, cy + r * 0.3f)
+                    path.lineTo(cx - r * 0.75f, cy + r * 0.3f)
+                    path.close()
+                    canvas.drawPath(path, fillPaint)
+                    if (iconType == IconType.SPEAKER_MUTE) {
+                        canvas.drawLine(cx - r * 0.7f, cy - r * 0.75f, cx + r * 0.75f, cy + r * 0.75f, strokePaint)
+                    } else {
+                        rect.set(cx - r * 0.1f, cy - r * 0.55f, cx + r * 0.65f, cy + r * 0.55f)
+                        canvas.drawArc(rect, -45f, 90f, false, strokePaint)
+                    }
+                }
+                IconType.PLAY_SOLID -> {
+                    path.moveTo(cx - r * 0.45f, cy - r * 0.72f)
+                    path.lineTo(cx + r * 0.68f, cy)
+                    path.lineTo(cx - r * 0.45f, cy + r * 0.72f)
+                    path.close()
+                    canvas.drawPath(path, fillPaint)
+                }
+                IconType.PAUSE_SOLID -> {
+                    rect.set(cx - r * 0.52f, cy - r * 0.68f, cx - r * 0.16f, cy + r * 0.68f)
+                    canvas.drawRoundRect(rect, r * 0.12f, r * 0.12f, fillPaint)
+                    rect.set(cx + r * 0.16f, cy - r * 0.68f, cx + r * 0.52f, cy + r * 0.68f)
+                    canvas.drawRoundRect(rect, r * 0.12f, r * 0.12f, fillPaint)
+                }
+                IconType.SKIP_PREV -> {
+                    canvas.drawLine(cx - r * 0.68f, cy - r * 0.55f, cx - r * 0.68f, cy + r * 0.55f, strokePaint)
+                    path.moveTo(cx, cy - r * 0.52f)
+                    path.lineTo(cx - r * 0.62f, cy)
+                    path.lineTo(cx, cy + r * 0.52f)
+                    path.close()
+                    canvas.drawPath(path, fillPaint)
+                    path.reset()
+                    path.moveTo(cx + r * 0.68f, cy - r * 0.52f)
+                    path.lineTo(cx + r * 0.06f, cy)
+                    path.lineTo(cx + r * 0.68f, cy + r * 0.52f)
+                    path.close()
+                    canvas.drawPath(path, fillPaint)
+                }
+                IconType.SKIP_NEXT -> {
+                    canvas.drawLine(cx + r * 0.68f, cy - r * 0.55f, cx + r * 0.68f, cy + r * 0.55f, strokePaint)
+                    path.moveTo(cx, cy - r * 0.52f)
+                    path.lineTo(cx + r * 0.62f, cy)
+                    path.lineTo(cx, cy + r * 0.52f)
+                    path.close()
+                    canvas.drawPath(path, fillPaint)
+                    path.reset()
+                    path.moveTo(cx - r * 0.68f, cy - r * 0.52f)
+                    path.lineTo(cx - r * 0.06f, cy)
+                    path.lineTo(cx - r * 0.68f, cy + r * 0.52f)
+                    path.close()
+                    canvas.drawPath(path, fillPaint)
+                }
+                IconType.CAPTURE_FRAME -> {
+                    val b = r * 0.82f
+                    val c = r * 0.35f
+                    canvas.drawLine(cx - b, cy - b, cx - b + c, cy - b, strokePaint)
+                    canvas.drawLine(cx - b, cy - b, cx - b, cy - b + c, strokePaint)
+                    canvas.drawLine(cx + b - c, cy - b, cx + b, cy - b, strokePaint)
+                    canvas.drawLine(cx + b, cy - b, cx + b, cy - b + c, strokePaint)
+                    canvas.drawLine(cx - b, cy + b - c, cx - b, cy + b, strokePaint)
+                    canvas.drawLine(cx - b, cy + b, cx - b + c, cy + b, strokePaint)
+                    canvas.drawLine(cx + b - c, cy + b, cx + b, cy + b, strokePaint)
+                    canvas.drawLine(cx + b, cy + b - c, cx + b, cy + b, strokePaint)
+                    rect.set(cx - r * 0.45f, cy - r * 0.35f, cx + r * 0.45f, cy + r * 0.45f)
+                    canvas.drawRoundRect(rect, r * 0.12f, r * 0.12f, strokePaint)
+                }
+                IconType.GIF_BADGE -> {
+                    rect.set(cx - r * 0.88f, cy - r * 0.68f, cx + r * 0.88f, cy + r * 0.68f)
+                    canvas.drawRoundRect(rect, r * 0.22f, r * 0.22f, strokePaint)
+                    val tp = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                        color = iconColor
+                        textSize = r * 0.72f
+                        typeface = Typeface.DEFAULT_BOLD
+                        textAlign = Paint.Align.CENTER
+                    }
+                    canvas.drawText("GIF", cx, cy + r * 0.26f, tp)
+                }
+                IconType.ASPECT_FIT -> {
+                    rect.set(cx - r * 0.85f, cy - r * 0.68f, cx + r * 0.85f, cy + r * 0.68f)
+                    canvas.drawRoundRect(rect, r * 0.2f, r * 0.2f, strokePaint)
+                    canvas.drawLine(cx - r * 0.5f, cy - r * 0.35f, cx - r * 0.2f, cy - r * 0.35f, strokePaint)
+                    canvas.drawLine(cx - r * 0.5f, cy - r * 0.35f, cx - r * 0.5f, cy - r * 0.05f, strokePaint)
+                    canvas.drawLine(cx + r * 0.5f, cy + r * 0.35f, cx + r * 0.2f, cy + r * 0.35f, strokePaint)
+                    canvas.drawLine(cx + r * 0.5f, cy + r * 0.35f, cx + r * 0.5f, cy + r * 0.05f, strokePaint)
+                }
+                IconType.PIP_WINDOW -> {
+                    rect.set(cx - r * 0.85f, cy - r * 0.68f, cx + r * 0.85f, cy + r * 0.68f)
+                    canvas.drawRoundRect(rect, r * 0.2f, r * 0.2f, strokePaint)
+                    rect.set(cx - r * 0.52f, cy - r * 0.35f, cx - r * 0.02f, cy + r * 0.12f)
+                    canvas.drawRoundRect(rect, r * 0.1f, r * 0.1f, fillPaint)
                 }
             }
         }
