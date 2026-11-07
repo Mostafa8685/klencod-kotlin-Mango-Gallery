@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">الاستديو</string>
+    <string name="app_name">Mango Gallery</string>
+    <string name="widget_photo_desc">ذكريات من معرضك، تتغير تلقائياً</string>
+    <string name="widget_quick_desc">وصول سريع للكاميرا والمعرض والخزنة</string>
 </resources>

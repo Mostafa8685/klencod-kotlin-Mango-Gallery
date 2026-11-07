@@ -1671,6 +1671,7 @@ class MainActivity : Activity() {
         if (isSelectionMode) {
             val actions = listOf(
                 BottomAction("نقل لألبوم", SamsungIconView.IconType.PLUS) { showAddSelectedToAlbumDialog() },
+                BottomAction("للخزنة", SamsungIconView.IconType.LOCK) { moveSelectedToVault() },
                 BottomAction("المفضلة", SamsungIconView.IconType.HEART) { toggleFavoriteForSelected() },
                 BottomAction("مشاركة", SamsungIconView.IconType.SHARE) { shareSelectedItems() },
                 BottomAction("حذف", SamsungIconView.IconType.TRASH) { deleteSelectedToTrash() }
@@ -1911,7 +1912,7 @@ class MainActivity : Activity() {
             setOnClickListener { showAboutBrandDialog() }
         }
         val brandTitle = TextView(this).apply {
-            text = "الاستديو"
+            text = "Mango Gallery"
             textSize = 19f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(colorTextPrimary)
@@ -2330,7 +2331,7 @@ class MainActivity : Activity() {
         val hasPerm = hasMediaPermission()
         val titleTv = TextView(this).apply {
             text = if (hasPerm) "لا توجد صور أو مقاطع فيديو على الهاتف"
-            else "يحتاج الاستديو إلى إذن الوصول للصور والفيديوهات"
+            else "يحتاج Mango Gallery إلى إذن الوصول للصور والفيديوهات"
             textSize = 17f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(colorTextPrimary)
@@ -2342,7 +2343,7 @@ class MainActivity : Activity() {
             text = if (hasPerm) {
                 "التقط صوراً بالكاميرا أو قم بتنزيل صور لتظهر هنا تلقائياً مقسمة حسب التاريخ والألبومات."
             } else {
-                "اضغط على الزر بالأسفل للسماح لتطبيق الاستديو بقراءة وعرض جميع صور وفيديوهات هاتفك الحقيقية."
+                "اضغط على الزر بالأسفل للسماح لتطبيق Mango Gallery بقراءة وعرض جميع صور وفيديوهات هاتفك الحقيقية."
             }
             textSize = 13.5f
             setTextColor(colorTextSecondary)
@@ -3446,6 +3447,24 @@ class MainActivity : Activity() {
 
         card.addView(
             row2,
+            LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(24) }
+        )
+
+        val row3 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.TOP
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+        row3.addView(
+            makeHamburgerGridItem("الخزنة الخاصة", SamsungIconView.IconType.LOCK) {
+                closeOverlay()
+                openVault()
+            },
+            LinearLayout.LayoutParams(0, -2, 1f)
+        )
+        for (k in 0 until 3) row3.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+        card.addView(
+            row3,
             LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(24) }
         )
 
@@ -4741,7 +4760,7 @@ class MainActivity : Activity() {
         }
         box.addView(createAppLogoBadge(72))
         val titleTv = TextView(this).apply {
-            text = "استديو سامسونج (One UI Gallery)"
+            text = "Mango Gallery"
             textSize = 17f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(colorTextPrimary)
@@ -4772,7 +4791,8 @@ class MainActivity : Activity() {
             "إعادة تسمية الملف",
             "نقل إلى ألبوم",
             "تعيين كخلفية للهاتف",
-            "بدء عرض الشرائح"
+            "بدء عرض الشرائح",
+            "إزالة عنصر من الصورة ✨"
         )
         AlertDialog.Builder(this)
             .setTitle(media.title)
@@ -4787,6 +4807,7 @@ class MainActivity : Activity() {
                     }
                     3 -> setAsDeviceWallpaper(media)
                     4 -> startSlideshow(getVisibleMediaItems())
+                    5 -> openObjectEraser(media)
                 }
             }
             .show()
@@ -5743,14 +5764,14 @@ class MainActivity : Activity() {
     private fun saveEditedPhotoToDevice(bitmap: Bitmap) {
         try {
             val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-            val fileName = "SamsungGallery_Edit_$ts.jpg"
+            val fileName = "MangoGallery_Edit_$ts.jpg"
             val values = ContentValues().apply {
                 put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
                 put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     put(
                         MediaStore.Images.Media.RELATIVE_PATH,
-                        Environment.DIRECTORY_PICTURES + "/SamsungGallery"
+                        Environment.DIRECTORY_PICTURES + "/Mango Gallery"
                     )
                 }
             }
@@ -6200,10 +6221,11 @@ class MainActivity : Activity() {
             "تغيير عدد أعمدة الصور (حالياً: ${toArabicDigits(picturesColumnCount)} أعمدة)",
             "إظهار كل الألبومات المخفية",
             "إعادة فحص وتحديث صور الهاتف",
-            "السماح بإدارة الوسائط (حذف بدون نافذة تأكيد)"
+            "السماح بإدارة الوسائط (حذف بدون نافذة تأكيد)",
+            "الخزنة الخاصة 🔒"
         )
         AlertDialog.Builder(this)
-            .setTitle("ضبط الاستديو (Samsung One UI)")
+            .setTitle("ضبط Mango Gallery")
             .setItems(items) { _, which ->
                 when (which) {
                     0 -> showThemeModeSelectorDialog()
@@ -6242,6 +6264,7 @@ class MainActivity : Activity() {
                         Toast.makeText(this, "جاري تحديث صور وفيديوهات الهاتف...", Toast.LENGTH_SHORT).show()
                     }
                     8 -> openManageMediaSettings()
+                    9 -> openVault()
                 }
             }
             .setPositiveButton("إغلاق", null)
@@ -7277,6 +7300,46 @@ class MainActivity : Activity() {
                 Toast.makeText(this, "تمت الإضافة إلى $target", Toast.LENGTH_SHORT).show()
             }
             .show()
+    }
+
+    // ============================================================
+    // الخزنة الخاصة + إزالة العناصر (Mango Gallery)
+    // ============================================================
+    private fun openVault() {
+        markExternalLaunch()
+        startActivity(Intent(this, VaultActivity::class.java))
+    }
+
+    private fun moveSelectedToVault() {
+        val visibleMap = getVisibleMediaItems().associateBy { it.id }
+        val uris = ArrayList<Uri>()
+        val names = ArrayList<String>()
+        val mimes = ArrayList<String>()
+        for (id in selectedMediaIds) {
+            val m = visibleMap[id] ?: continue
+            uris.add(m.contentUri)
+            names.add(m.title)
+            mimes.add(contentResolver.getType(m.contentUri) ?: (if (m.isVideo) "video/mp4" else "image/jpeg"))
+        }
+        if (uris.isEmpty()) return
+        exitSelectionModeFast()
+        markExternalLaunch()
+        val i = Intent(this, VaultActivity::class.java)
+        i.putParcelableArrayListExtra(VaultActivity.EXTRA_IMPORT_URIS, uris)
+        i.putStringArrayListExtra(VaultActivity.EXTRA_IMPORT_NAMES, names)
+        i.putStringArrayListExtra(VaultActivity.EXTRA_IMPORT_MIMES, mimes)
+        startActivity(i)
+    }
+
+    private fun openObjectEraser(media: MediaItem) {
+        if (media.isVideo) {
+            Toast.makeText(this, "إزالة العناصر متاحة للصور فقط", Toast.LENGTH_SHORT).show()
+            return
+        }
+        markExternalLaunch()
+        val i = Intent(this, EraserActivity::class.java)
+        i.putExtra(EraserActivity.EXTRA_URI, media.contentUri)
+        startActivity(i)
     }
 
     private fun shareSelectedItems() {

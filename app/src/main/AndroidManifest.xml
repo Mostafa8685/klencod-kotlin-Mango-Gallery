@@ -43,5 +43,47 @@
             </intent-filter>
         </activity>
 
+        <!-- الخزنة الخاصة (مشفّرة، بكلمة سر وبصمة مستقلتين) -->
+        <activity
+            android:name=".VaultActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|uiMode"
+            android:screenOrientation="portrait"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />
+
+        <!-- إزالة العناصر من الصور -->
+        <activity
+            android:name=".EraserActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|uiMode"
+            android:screenOrientation="portrait"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />
+
+        <!-- ودجتس الشاشة الرئيسية -->
+        <receiver
+            android:name=".MangoPhotoWidgetProvider"
+            android:exported="true"
+            android:label="Mango • ذكريات">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/mango_widget_photo_info" />
+        </receiver>
+
+        <receiver
+            android:name=".MangoQuickWidgetProvider"
+            android:exported="true"
+            android:label="Mango • وصول سريع">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/mango_widget_quick_info" />
+        </receiver>
+
     </application>
 </manifest>
