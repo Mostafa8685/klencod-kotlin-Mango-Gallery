@@ -2,10 +2,14 @@ package com.m3rd.app
 
 import android.app.Activity
 import android.content.ContentValues
+import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.ColorMatrix
-import android.graphics.ColorMatrixColorFilter
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.media.MediaCodec
@@ -22,14 +26,13 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
+import android.provider.OpenableColumns
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
-import android.widget.ImageView
 import android.widget.LinearLayout
-import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import android.widget.VideoView
@@ -39,33 +42,35 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * استوديو محرر الفيديو والمونتاج الاحترافي (Mango Pro Video Editor Studio).
- * - قص وتشذيب الفيديو بدقة عالية (Start / End Timeline Scrubber مع شريط الإطارات المصغرة).
- * - تصدير فوري فائق السرعة بدون فقدان الجودة (Hardware Lossless Stream Copy عبر MediaExtractor & MediaMuxer) يعمل بسلاسة حتى على الأجهزة الضعيفة.
- * - التحكم في الصوت (كتم الصوت / استبدال أو إبقاء الصوت الأصلي).
- * - سرعات العرض السينمائية (0.5x بطيء، 1.0x، 1.5x، 2.0x سريع) + نسب الأبعاد (16:9، 9:16، 1:1، أصلي).
- * - معاينة الفلاتر السينمائية واستخراج لقطات الفيديو عالية الدقة (4K Frame Grab).
+ * استوديو مونتاج الفيديو الاحترافي (Samsung One UI Studio Video Editor).
+ * - شريط زمني سينمائي موحد للقص باللمس (`VideoTimelineTrimView`) مع إطارات مصغرة حقيقية، ومقبضي سحب للبداية والنهاية، ومؤشر تشغيل حي (Playhead).
+ * - استيراد وتحميل ملفات الترجمة الخارجية (`.srt` / `.vtt`) وعرضها متزامنة مع الفيديو مع التحكم في حجم ولون ومزامنة الترجمة.
+ * - تصدير فوري فائق السرعة بدون فقدان الجودة عبر `MediaExtractor` و `MediaMuxer`.
+ * - التحكم في السرعة (`0.5x` إلى `2.0x`)، وكتم/تشغيل الصوت، والفلاتر السينمائية، ونسب الأبعاد، واستخراج الإطارات عالية الدقة.
+ * - تصميم خالٍ تماماً من الإيموجيات ويعتمد كلياً على أيقونات المتجهات وهوية Mango Gallery.
  */
 class VideoEditorActivity : Activity() {
 
     companion object {
         const val EXTRA_VIDEO_URI = "video_editor_uri"
         const val EXTRA_VIDEO_TITLE = "video_editor_title"
+        private const val REQ_PICK_SUBTITLE = 5201
     }
 
-    private val bg = 0xFF090B10.toInt()
-    private val card = 0xFF161922.toInt()
-    private val border = 0xFF262C3A.toInt()
-    private val accent = 0xFF0A78D6.toInt()
-    private val accentLight = 0xFF8CD0FA.toInt()
-    private val mangoGold = 0xFFFF9800.toInt()
-    private val textPrimary = 0xFFF5F7FA.toInt()
-    private val textSecondary = 0xFF98A2B3.toInt()
+    private val colorPureBlack = 0xFF000000.toInt()
+    private val colorCardDark = 0xFF1C1C1E.toInt()
+    private val colorCardElevated = 0xFF26262A.toInt()
+    private val colorBorderSubtle = 0xFF2E2E34.toInt()
+    private val colorSamsungBlue = 0xFF0A78D6.toInt()
+    private val colorBrandIceBlue = 0xFF8CD0FA.toInt()
+    private val textPrimary = 0xFFF5F5F7.toInt()
+    private val textSecondary = 0xFF98989E.toInt()
 
     private val handler = Handler(Looper.getMainLooper())
     private val io = Executors.newFixedThreadPool(2)
@@ -77,26 +82,33 @@ class VideoEditorActivity : Activity() {
     private var trimEndMs: Long = 0L
     private var muteAudio: Boolean = false
     private var playbackSpeed: Float = 1.0f
-    private var aspectMode: Int = 0 // 0=أصلي, 1=9:16 ريلز, 2=16:9 يوتيوب, 3=1:1 مربع
+    private var aspectMode: Int = 0 // 0=أصلي, 1=9:16, 2=16:9, 3=1:1
     private var filterMode: Int = 0 // 0=أصلي, 1=سينمائي, 2=دافئ, 3=بارد, 4=أبيض وأسود
-    private var activeTab: Int = 0  // 0=القص, 1=السرعة والصوت, 2=الفلاتر والأبعاد, 3=التقاط إطار
+    private var activeTab: Int = 0  // 0=القص, 1=السرعة والصوت, 2=الفلاتر والأبعاد, 3=الترجمة (CC)
     private var exporting: Boolean = false
+
+    // بيانات ملف الترجمة الخارجي (SRT / VTT)
+    private var subtitleCues: List<SubtitleCue> = emptyList()
+    private var subtitleFileName: String = ""
+    private var subtitleOffsetMs: Long = 0L
+    private var subtitleTextSizeSp: Float = 16.5f
+    private var subtitleColorMode: Int = 0 // 0=أبيض، 1=أصفر سينمائي، 2=أزرق جليدي
 
     private lateinit var videoHolder: FrameLayout
     private lateinit var videoView: VideoView
     private lateinit var filterTintOverlay: View
-    private lateinit var playPauseBtn: TextView
+    private lateinit var subtitleOverlayTv: TextView
+    private lateinit var playPauseIconContainer: FrameLayout
     private lateinit var currentTimeTv: TextView
-    private lateinit var trimRangeSummaryTv: TextView
-    private lateinit var filmstripRow: LinearLayout
-    private lateinit var startSeek: SeekBar
-    private lateinit var endSeek: SeekBar
-    private lateinit var toolPanel: LinearLayout
+    private lateinit var totalCutDurationTv: TextView
+    private lateinit var timelineTrimView: VideoTimelineTrimView
+    private lateinit var toolPanelContainer: LinearLayout
     private lateinit var exportOverlay: FrameLayout
     private lateinit var exportStatusTv: TextView
     private var mediaPlayerRef: MediaPlayer? = null
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+    private fun dpF(v: Float): Float = v * resources.displayMetrics.density
 
     private fun roundBg(color: Int, radiusDp: Float, strokeColor: Int = 0): GradientDrawable =
         GradientDrawable().apply {
@@ -107,8 +119,8 @@ class VideoEditorActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.statusBarColor = bg
-        window.navigationBarColor = bg
+        window.statusBarColor = colorPureBlack
+        window.navigationBarColor = colorPureBlack
 
         val uri = intent?.getParcelableExtra<Uri>(EXTRA_VIDEO_URI)
         if (uri == null) {
@@ -118,53 +130,70 @@ class VideoEditorActivity : Activity() {
         videoUri = uri
         videoTitle = intent?.getStringExtra(EXTRA_VIDEO_TITLE) ?: "فيديو"
 
-        val root = FrameLayout(this).apply { setBackgroundColor(bg) }
-        val page = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val root = FrameLayout(this).apply { setBackgroundColor(colorPureBlack) }
+        val page = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
 
-        // الشريط العلوي
+        // 1. الشريط العلوي الاحترافي المطابق لمحرر سامسونج:
+        // يسار: [ حفظ ] [ إرجاع ]  <--->  يمين: [ اسم الفيديو ] [ رجوع › ]
         val topBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(10), dp(32), dp(12), dp(10))
+            setPadding(dp(12), dp(32), dp(14), dp(10))
+            setBackgroundColor(colorPureBlack)
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
         }
-        topBar.addView(TextView(this).apply {
-            text = "✕"
-            textSize = 20f
-            setTextColor(Color.WHITE)
-            setPadding(dp(10), dp(6), dp(10), dp(6))
-            setOnClickListener { if (!exporting) finish() }
-        })
-        val titleCol = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(8), 0, dp(8), 0)
-        }
-        titleCol.addView(TextView(this).apply {
-            text = "استوديو مونتاج الفيديو 🎬"
-            textSize = 17f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(textPrimary)
-        })
-        titleCol.addView(TextView(this).apply {
-            text = videoTitle
-            textSize = 11.5f
-            setTextColor(textSecondary)
-            maxLines = 1
-        })
-        topBar.addView(titleCol, LinearLayout.LayoutParams(0, -2, 1f))
 
         val saveBtn = TextView(this).apply {
-            text = "تصدير وحفظ ✨"
-            textSize = 14f
+            text = "حفظ الفيديو"
+            textSize = 14.5f
             typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Color.BLACK)
-            background = roundBg(mangoGold, 16f)
-            setPadding(dp(16), dp(9), dp(16), dp(9))
+            setTextColor(Color.WHITE)
+            background = roundBg(colorSamsungBlue, 18f)
+            setPadding(dp(16), dp(8), dp(16), dp(8))
             setOnClickListener { if (!exporting) exportEditedVideo() }
         }
         topBar.addView(saveBtn)
+
+        val revertBtn = TextView(this).apply {
+            text = "إرجاع"
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(textSecondary)
+            setPadding(dp(14), dp(8), dp(14), dp(8))
+            setOnClickListener { resetAllVideoEdits() }
+        }
+        topBar.addView(revertBtn, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(4) })
+
+        val titleTv = TextView(this).apply {
+            text = videoTitle
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(textPrimary)
+            gravity = Gravity.RIGHT or Gravity.CENTER_VERTICAL
+            maxLines = 1
+            setPadding(dp(10), 0, dp(10), 0)
+        }
+        topBar.addView(titleTv, LinearLayout.LayoutParams(0, -2, 1f))
+
+        val backBtn = FrameLayout(this).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(colorCardDark)
+                setStroke(dp(1), colorBorderSubtle)
+            }
+            addView(
+                MainActivity.SamsungIconView(this@VideoEditorActivity, MainActivity.SamsungIconView.IconType.CHEVRON_RIGHT, Color.WHITE, 2.0f),
+                FrameLayout.LayoutParams(dp(18), dp(18), Gravity.CENTER)
+            )
+            setOnClickListener { if (!exporting) finish() }
+        }
+        topBar.addView(backBtn, LinearLayout.LayoutParams(dp(38), dp(38)))
         page.addView(topBar, LinearLayout.LayoutParams(-1, -2))
 
-        // منطقة معاينة الفيديو السينمائية
+        // 2. منطقة شاشة عرض الفيديو والترجمة المتزامنة
         videoHolder = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
         }
@@ -177,173 +206,173 @@ class VideoEditorActivity : Activity() {
         }
         videoHolder.addView(filterTintOverlay, FrameLayout.LayoutParams(-1, -1))
 
-        playPauseBtn = TextView(this).apply {
-            text = "⏸"
-            textSize = 20f
-            setTextColor(Color.WHITE)
-            gravity = Gravity.CENTER
-            background = roundBg(0x88000000.toInt(), 28f, 0x55FFFFFF)
-            setOnClickListener { togglePlayback() }
-        }
-        videoHolder.addView(playPauseBtn, FrameLayout.LayoutParams(dp(52), dp(52), Gravity.BOTTOM or Gravity.START).apply {
-            leftMargin = dp(14)
-            bottomMargin = dp(14)
-        })
-
-        currentTimeTv = TextView(this).apply {
-            text = "0:00 / 0:00"
-            textSize = 12.5f
+        // طبقة عرض الترجمة المتزامنة (Subtitle Cue Overlay)
+        subtitleOverlayTv = TextView(this).apply {
+            text = ""
+            textSize = subtitleTextSizeSp
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.WHITE)
-            background = roundBg(0x99000000.toInt(), 12f)
-            setPadding(dp(12), dp(6), dp(12), dp(6))
+            gravity = Gravity.CENTER
+            setPadding(dp(16), dp(8), dp(16), dp(8))
+            background = roundBg(0xBB000000.toInt(), 12f)
+            visibility = View.GONE
         }
-        videoHolder.addView(currentTimeTv, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END).apply {
-            rightMargin = dp(14)
-            bottomMargin = dp(14)
-        })
+        videoHolder.addView(
+            subtitleOverlayTv,
+            FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
+                bottomMargin = dp(20)
+                leftMargin = dp(20)
+                rightMargin = dp(20)
+            }
+        )
 
         page.addView(videoHolder, LinearLayout.LayoutParams(-1, 0, 1f))
 
-        // منطقة الخط الزمني (Timeline & Filmstrip) والأدوات السفلية
-        val bottomArea = LinearLayout(this).apply {
+        // 3. شريط التحكم بالتشغيل والوقت والتقاط الإطار (Transport Bar)
+        val transportBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(10), dp(16), dp(8))
+            setBackgroundColor(colorPureBlack)
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+
+        playPauseIconContainer = FrameLayout(this).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(colorSamsungBlue)
+            }
+            setOnClickListener { togglePlayback() }
+        }
+        updatePlayPauseButtonIcon(true)
+        transportBar.addView(playPauseIconContainer, LinearLayout.LayoutParams(dp(38), dp(38)))
+
+        currentTimeTv = TextView(this).apply {
+            text = "0:00.0"
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+            setPadding(dp(12), 0, dp(8), 0)
+        }
+        transportBar.addView(currentTimeTv)
+
+        transportBar.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+
+        totalCutDurationTv = TextView(this).apply {
+            text = "المدة المحددة: 0:00.0"
+            textSize = 12f
+            setTextColor(colorBrandIceBlue)
+            setPadding(dp(8), 0, dp(12), 0)
+        }
+        transportBar.addView(totalCutDurationTv)
+
+        val snapFrameBtn = FrameLayout(this).apply {
+            background = roundBg(colorCardDark, 14f, colorBorderSubtle)
+            addView(
+                MainActivity.SamsungIconView(this@VideoEditorActivity, MainActivity.SamsungIconView.IconType.CAPTURE_FRAME, Color.WHITE, 1.9f),
+                FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER)
+            )
+            setOnClickListener { captureCurrentFrameToGallery() }
+        }
+        transportBar.addView(snapFrameBtn, LinearLayout.LayoutParams(dp(38), dp(38)))
+
+        page.addView(transportBar, LinearLayout.LayoutParams(-1, -2))
+
+        // 4. منطقة الخط الزمني التفاعلي الموحد والأدوات السفلية (Studio Deck)
+        val studioDeck = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = GradientDrawable().apply {
-                setColor(card)
+                setColor(colorCardDark)
                 cornerRadii = floatArrayOf(
-                    dp(24).toFloat(), dp(24).toFloat(),
-                    dp(24).toFloat(), dp(24).toFloat(),
+                    dpF(24f), dpF(24f),
+                    dpF(24f), dpF(24f),
                     0f, 0f, 0f, 0f
                 )
-                setStroke(dp(1), border)
+                setStroke(dp(1), colorBorderSubtle)
             }
-            setPadding(dp(14), dp(12), dp(14), dp(16))
+            setPadding(dp(14), dp(14), dp(14), dp(16))
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
         }
 
-        trimRangeSummaryTv = TextView(this).apply {
-            text = "نطاق المونتاج: كامل الفيديو"
-            textSize = 12.5f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(accentLight)
-            gravity = Gravity.CENTER
+        // الشريط الزمني التفاعلي الموحد (VideoTimelineTrimView)
+        timelineTrimView = VideoTimelineTrimView(this) { newStartRatio, newEndRatio, seekRatio, isDraggingHandle ->
+            if (durationMs > 0L) {
+                trimStartMs = (newStartRatio * durationMs).toLong().coerceIn(0L, max(0L, durationMs - 500L))
+                trimEndMs = (newEndRatio * durationMs).toLong().coerceIn(min(durationMs, trimStartMs + 500L), durationMs)
+                val targetSeekMs = (seekRatio * durationMs).toLong().coerceIn(trimStartMs, trimEndMs)
+                try {
+                    videoView.seekTo(targetSeekMs.toInt())
+                } catch (_: Throwable) {}
+                currentTimeTv.text = formatMs(targetSeekMs)
+                updateTrimSummary()
+            }
         }
-        bottomArea.addView(trimRangeSummaryTv, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(6) })
+        studioDeck.addView(timelineTrimView, LinearLayout.LayoutParams(-1, dp(68)).apply { bottomMargin = dp(12) })
 
-        // شريط الإطارات المصغرة (Filmstrip Timeline)
-        val filmScroll = HorizontalScrollView(this).apply {
-            isHorizontalScrollBarEnabled = false
+        // لوحة خيارات التبويب النشط
+        toolPanelContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(0, dp(4), 0, dp(10))
         }
-        filmstripRow = LinearLayout(this).apply {
+        studioDeck.addView(toolPanelContainer, LinearLayout.LayoutParams(-1, -2))
+
+        // شريط التبويبات السفلية الأربعة بأيقونات المتجهات ونصوص نظيفة بدون إيموجي
+        val bottomTabsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            background = roundBg(0xFF0E1016.toInt(), 10f, mangoGold)
-            setPadding(dp(4), dp(4), dp(4), dp(4))
+            setPadding(dp(4), dp(6), dp(4), 0)
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
         }
-        filmScroll.addView(filmstripRow)
-        bottomArea.addView(filmScroll, LinearLayout.LayoutParams(-1, dp(56)).apply { bottomMargin = dp(8) })
 
-        // منزلقات البداية والنهاية للقص الدقيق
-        val startRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        startRow.addView(TextView(this).apply {
-            text = "البداية:"
-            textSize = 12f
-            setTextColor(textSecondary)
-        }, LinearLayout.LayoutParams(dp(52), -2))
-        startSeek = SeekBar(this).apply {
-            max = 1000
-            progress = 0
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                    if (!fromUser || durationMs <= 0L) return
-                    val candidate = (durationMs * p) / 1000L
-                    trimStartMs = min(candidate, max(0L, trimEndMs - 500L))
-                    videoView.seekTo(trimStartMs.toInt())
-                    updateTrimSummary()
+        data class VideoEditorTabDef(val title: String, val icon: MainActivity.SamsungIconView.IconType, val index: Int)
+        val tabDefs = listOf(
+            VideoEditorTabDef("الترجمة CC", MainActivity.SamsungIconView.IconType.INFO_CIRCLE, 3),
+            VideoEditorTabDef("الفلاتر والأبعاد", MainActivity.SamsungIconView.IconType.TAB_THREE_CIRCLES, 2),
+            VideoEditorTabDef("السرعة والصوت", MainActivity.SamsungIconView.IconType.SPEAKER_ON, 1),
+            VideoEditorTabDef("القص والتشذيب", MainActivity.SamsungIconView.IconType.TAB_CROP_ROTATE, 0)
+        )
+
+        fun rebuildBottomTabsAndPanel() {
+            bottomTabsRow.removeAllViews()
+            for (tDef in tabDefs) {
+                val selected = (activeTab == tDef.index)
+                val tabCol = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    gravity = Gravity.CENTER
+                    isClickable = true
+                    setPadding(dp(6), dp(8), dp(6), dp(8))
+                    background = if (selected) roundBg(0x280A78D6, 16f, colorSamsungBlue) else null
+                    setOnClickListener {
+                        activeTab = tDef.index
+                        rebuildBottomTabsAndPanel()
+                    }
                 }
-                override fun onStartTrackingTouch(sb: SeekBar?) {}
-                override fun onStopTrackingTouch(sb: SeekBar?) {}
-            })
-        }
-        startRow.addView(startSeek, LinearLayout.LayoutParams(0, -2, 1f))
-        bottomArea.addView(startRow, LinearLayout.LayoutParams(-1, -2))
-
-        val endRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        endRow.addView(TextView(this).apply {
-            text = "النهاية:"
-            textSize = 12f
-            setTextColor(textSecondary)
-        }, LinearLayout.LayoutParams(dp(52), -2))
-        endSeek = SeekBar(this).apply {
-            max = 1000
-            progress = 1000
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                    if (!fromUser || durationMs <= 0L) return
-                    val candidate = (durationMs * p) / 1000L
-                    trimEndMs = max(candidate, min(durationMs, trimStartMs + 500L))
-                    videoView.seekTo(trimEndMs.toInt())
-                    updateTrimSummary()
-                }
-                override fun onStartTrackingTouch(sb: SeekBar?) {}
-                override fun onStopTrackingTouch(sb: SeekBar?) {}
-            })
-        }
-        endRow.addView(endSeek, LinearLayout.LayoutParams(0, -2, 1f))
-        bottomArea.addView(endRow, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
-
-        // لوحة الأدوات المتغيرة حسب التبويب
-        toolPanel = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-            setPadding(0, dp(10), 0, dp(10))
-        }
-        bottomArea.addView(toolPanel, LinearLayout.LayoutParams(-1, -2))
-
-        // شريط التبويبات السفلية للمونتاج
-        val tabsRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-        }
-        val tabTitles = arrayOf("✂️ القص", "⚡ السرعة والصوت", "🎨 الفلاتر والأبعاد", "📸 لقطة إطار")
-        val tabBtns = ArrayList<TextView>()
-
-        fun refreshTabs() {
-            for (i in tabBtns.indices) {
-                val sel = (activeTab == i)
-                tabBtns[i].background = if (sel) roundBg(accent, 14f) else roundBg(bg, 14f, border)
-                tabBtns[i].setTextColor(if (sel) Color.WHITE else textSecondary)
+                val icColor = if (selected) colorBrandIceBlue else Color.WHITE
+                tabCol.addView(
+                    MainActivity.SamsungIconView(this, tDef.icon, icColor, 1.9f),
+                    LinearLayout.LayoutParams(dp(20), dp(20))
+                )
+                tabCol.addView(TextView(this).apply {
+                    text = tDef.title
+                    textSize = 11f
+                    typeface = Typeface.DEFAULT_BOLD
+                    setTextColor(icColor)
+                    gravity = Gravity.CENTER
+                }, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(4) })
+                bottomTabsRow.addView(tabCol, LinearLayout.LayoutParams(0, -2, 1f).apply {
+                    leftMargin = dp(3)
+                    rightMargin = dp(3)
+                })
             }
             rebuildActiveToolPanel()
         }
 
-        for (i in tabTitles.indices) {
-            val b = TextView(this).apply {
-                text = tabTitles[i]
-                textSize = 11.5f
-                typeface = Typeface.DEFAULT_BOLD
-                gravity = Gravity.CENTER
-                setPadding(dp(8), dp(9), dp(8), dp(9))
-                setOnClickListener {
-                    activeTab = i
-                    refreshTabs()
-                }
-            }
-            tabBtns.add(b)
-            tabsRow.addView(b, LinearLayout.LayoutParams(0, -2, 1f).apply {
-                if (i < tabTitles.size - 1) rightMargin = dp(5)
-            })
-        }
-        bottomArea.addView(tabsRow, LinearLayout.LayoutParams(-1, -2))
-        page.addView(bottomArea, LinearLayout.LayoutParams(-1, -2))
+        studioDeck.addView(bottomTabsRow, LinearLayout.LayoutParams(-1, -2))
+        page.addView(studioDeck, LinearLayout.LayoutParams(-1, -2))
         root.addView(page, FrameLayout.LayoutParams(-1, -1))
 
-        // شاشة التقدم أثناء التصدير
+        // طبقة التصدير
         exportOverlay = FrameLayout(this).apply {
             setBackgroundColor(0xCC000000.toInt())
             visibility = View.GONE
@@ -352,7 +381,7 @@ class VideoEditorActivity : Activity() {
         val expCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            background = roundBg(card, 20f, border)
+            background = roundBg(colorCardDark, 22f, colorBorderSubtle)
             setPadding(dp(28), dp(24), dp(28), dp(24))
         }
         exportStatusTv = TextView(this).apply {
@@ -367,9 +396,33 @@ class VideoEditorActivity : Activity() {
         root.addView(exportOverlay, FrameLayout.LayoutParams(-1, -1))
 
         setContentView(root)
-        refreshTabs()
+        rebuildBottomTabsAndPanel()
         setupVideoPlayback(uri)
-        loadFilmstripThumbnails(uri)
+        loadFilmstripFrames(uri)
+    }
+
+    private fun updatePlayPauseButtonIcon(playing: Boolean) {
+        playPauseIconContainer.removeAllViews()
+        val ic = if (playing) MainActivity.SamsungIconView.IconType.PAUSE_SOLID else MainActivity.SamsungIconView.IconType.PLAY_SOLID
+        playPauseIconContainer.addView(
+            MainActivity.SamsungIconView(this, ic, Color.WHITE, 2.0f),
+            FrameLayout.LayoutParams(dp(18), dp(18), Gravity.CENTER)
+        )
+    }
+
+    private fun resetAllVideoEdits() {
+        trimStartMs = 0L
+        trimEndMs = durationMs
+        muteAudio = false
+        playbackSpeed = 1.0f
+        aspectMode = 0
+        filterMode = 0
+        timelineTrimView.setRange(0f, 1f, 0f)
+        applySpeedAndAudio()
+        applyFilterAndAspectPreview()
+        updateTrimSummary()
+        rebuildActiveToolPanel()
+        Toast.makeText(this, "تمت استعادة إعدادات الفيديو الأصلية", Toast.LENGTH_SHORT).show()
     }
 
     private fun setupVideoPlayback(uri: Uri) {
@@ -384,7 +437,7 @@ class VideoEditorActivity : Activity() {
             applySpeedAndAudio()
             updateTrimSummary()
             videoView.start()
-            playPauseBtn.text = "⏸"
+            updatePlayPauseButtonIcon(true)
             handler.post(progressUpdater)
         }
     }
@@ -398,10 +451,25 @@ class VideoEditorActivity : Activity() {
                     if (trimEndMs > 0L && pos >= trimEndMs) {
                         videoView.seekTo(trimStartMs.toInt())
                     }
-                    currentTimeTv.text = "${formatMs(pos)} / ${formatMs(durationMs)}"
+                    currentTimeTv.text = formatMs(pos)
+                    if (durationMs > 0L) {
+                        timelineTrimView.updatePlayhead((pos.toFloat() / durationMs).coerceIn(0f, 1f))
+                    }
+                    // تحديث سطر الترجمة المتزامن
+                    if (subtitleCues.isNotEmpty()) {
+                        val cueText = SubtitleParser.findActiveCue(subtitleCues, pos, subtitleOffsetMs)
+                        if (!cueText.isNullOrBlank()) {
+                            subtitleOverlayTv.text = cueText
+                            subtitleOverlayTv.visibility = View.VISIBLE
+                        } else {
+                            subtitleOverlayTv.visibility = View.GONE
+                        }
+                    } else {
+                        subtitleOverlayTv.visibility = View.GONE
+                    }
                 }
             } catch (_: Throwable) {}
-            handler.postDelayed(this, 200L)
+            handler.postDelayed(this, 100L)
         }
     }
 
@@ -409,13 +477,13 @@ class VideoEditorActivity : Activity() {
         try {
             if (videoView.isPlaying) {
                 videoView.pause()
-                playPauseBtn.text = "▶"
+                updatePlayPauseButtonIcon(false)
             } else {
                 if (videoView.currentPosition < trimStartMs || videoView.currentPosition >= trimEndMs) {
                     videoView.seekTo(trimStartMs.toInt())
                 }
                 videoView.start()
-                playPauseBtn.text = "⏸"
+                updatePlayPauseButtonIcon(true)
             }
         } catch (_: Throwable) {}
     }
@@ -433,8 +501,8 @@ class VideoEditorActivity : Activity() {
 
     private fun updateTrimSummary() {
         val cutDur = max(0L, trimEndMs - trimStartMs)
-        val audioTag = if (muteAudio) "🔇 بدون صوت" else "🔊 صوت أصلي"
-        trimRangeSummaryTv.text = "القص: ${formatMs(trimStartMs)} ← ${formatMs(trimEndMs)} (المدة: ${formatMs(cutDur)}) • ${playbackSpeed}x • $audioTag"
+        val audioTag = if (muteAudio) "صوت مكتوم" else "صوت أصلي"
+        totalCutDurationTv.text = "النطاق: ${formatMs(trimStartMs)} - ${formatMs(trimEndMs)} (${formatMs(cutDur)}) • ${playbackSpeed}x • $audioTag"
     }
 
     private fun formatMs(ms: Long): String {
@@ -446,78 +514,193 @@ class VideoEditorActivity : Activity() {
     }
 
     private fun rebuildActiveToolPanel() {
-        toolPanel.removeAllViews()
+        toolPanelContainer.removeAllViews()
+        val scroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+        }
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+        }
+
         when (activeTab) {
             0 -> {
-                // أدوات القص السريع
-                toolPanel.addView(chipBtn("إعادة ضبط القص الكامل") {
+                // أدوات القص السريع والدقيق
+                row.addView(chipBtn("كامل الفيديو", trimStartMs == 0L && trimEndMs == durationMs) {
                     trimStartMs = 0L
                     trimEndMs = durationMs
-                    startSeek.progress = 0
-                    endSeek.progress = 1000
+                    timelineTrimView.setRange(0f, 1f, 0f)
                     videoView.seekTo(0)
                     updateTrimSummary()
+                    rebuildActiveToolPanel()
                 })
-                toolPanel.addView(chipBtn("قص أول 15 ثانية (Reels)") {
-                    trimStartMs = 0L
-                    trimEndMs = min(durationMs, 15_000L)
-                    startSeek.progress = 0
-                    endSeek.progress = ((trimEndMs * 1000L) / max(1L, durationMs)).toInt()
-                    videoView.seekTo(0)
-                    updateTrimSummary()
+                row.addView(chipBtn("قص لـ ١٥ ثانية (Reels)") {
+                    if (durationMs > 0L) {
+                        trimStartMs = 0L
+                        trimEndMs = min(durationMs, 15_000L)
+                        timelineTrimView.setRange(0f, trimEndMs.toFloat() / durationMs, 0f)
+                        videoView.seekTo(0)
+                        updateTrimSummary()
+                    }
                 })
-                toolPanel.addView(chipBtn("قص أول 30 ثانية") {
-                    trimStartMs = 0L
-                    trimEndMs = min(durationMs, 30_000L)
-                    startSeek.progress = 0
-                    endSeek.progress = ((trimEndMs * 1000L) / max(1L, durationMs)).toInt()
-                    videoView.seekTo(0)
-                    updateTrimSummary()
+                row.addView(chipBtn("قص لـ ٣٠ ثانية") {
+                    if (durationMs > 0L) {
+                        trimStartMs = 0L
+                        trimEndMs = min(durationMs, 30_000L)
+                        timelineTrimView.setRange(0f, trimEndMs.toFloat() / durationMs, 0f)
+                        videoView.seekTo(0)
+                        updateTrimSummary()
+                    }
+                })
+                row.addView(chipBtn("تعيين البداية عند المؤشر") {
+                    if (durationMs > 0L) {
+                        val pos = videoView.currentPosition.toLong()
+                        if (pos < trimEndMs - 500L) {
+                            trimStartMs = pos
+                            timelineTrimView.setRange(trimStartMs.toFloat() / durationMs, trimEndMs.toFloat() / durationMs, pos.toFloat() / durationMs)
+                            updateTrimSummary()
+                        }
+                    }
+                })
+                row.addView(chipBtn("تعيين النهاية عند المؤشر") {
+                    if (durationMs > 0L) {
+                        val pos = videoView.currentPosition.toLong()
+                        if (pos > trimStartMs + 500L) {
+                            trimEndMs = pos
+                            timelineTrimView.setRange(trimStartMs.toFloat() / durationMs, trimEndMs.toFloat() / durationMs, pos.toFloat() / durationMs)
+                            updateTrimSummary()
+                        }
+                    }
                 })
             }
             1 -> {
                 // السرعة والصوت
-                val muteBtn = chipBtn(if (muteAudio) "🔇 الصوت مكتوم (اضغط للتشغيل)" else "🔊 كتم صوت الفيديو") {
+                row.addView(chipBtn(if (muteAudio) "الصوت: مكتوم" else "الصوت: مفعّل", muteAudio) {
                     muteAudio = !muteAudio
                     applySpeedAndAudio()
                     updateTrimSummary()
                     rebuildActiveToolPanel()
-                }
-                toolPanel.addView(muteBtn)
-                val speeds = floatArrayOf(0.5f, 1.0f, 1.5f, 2.0f)
+                })
+                val speeds = floatArrayOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
                 for (sp in speeds) {
-                    val active = (playbackSpeed == sp)
-                    val btn = chipBtn("${sp}x", active) {
+                    row.addView(chipBtn("سرعة ${sp}x", playbackSpeed == sp) {
                         playbackSpeed = sp
                         applySpeedAndAudio()
                         updateTrimSummary()
                         rebuildActiveToolPanel()
-                    }
-                    toolPanel.addView(btn)
+                    })
                 }
             }
             2 -> {
-                // الفلاتر السينمائية ونسب الأبعاد
-                val filterNames = arrayOf("أصلي", "سينمائي", "ذهبي دافئ", "أزرق بارد", "درامي داكن")
+                // الفلاتر والأبعاد
+                val aspectNames = arrayOf("الأبعاد: أصلي", "الأبعاد: 9:16 طولي", "الأبعاد: 16:9 سينمائي", "الأبعاد: 1:1 مربع")
+                row.addView(chipBtn(aspectNames[aspectMode], aspectMode != 0) {
+                    aspectMode = (aspectMode + 1) % 4
+                    applyFilterAndAspectPreview()
+                    rebuildActiveToolPanel()
+                })
+                val filterNames = arrayOf("فلتر: أصلي", "سينمائي أزرق", "ذهبي دافئ", "جليدي بارد", "تباين داكن")
                 for (i in filterNames.indices) {
-                    toolPanel.addView(chipBtn(filterNames[i], filterMode == i) {
+                    row.addView(chipBtn(filterNames[i], filterMode == i && i != 0) {
                         filterMode = i
                         applyFilterAndAspectPreview()
                         rebuildActiveToolPanel()
                     })
                 }
-                val aspectBtn = chipBtn("النسبة: ${when (aspectMode) { 1 -> "9:16"; 2 -> "16:9"; 3 -> "1:1"; else -> "أصلي" }}") {
-                    aspectMode = (aspectMode + 1) % 4
-                    applyFilterAndAspectPreview()
-                    rebuildActiveToolPanel()
-                }
-                toolPanel.addView(aspectBtn)
             }
             3 -> {
-                // استخراج إطار عالي الدقة كصورة
-                toolPanel.addView(chipBtn("📸 حفظ المشهد الحالي كصورة عالية الدقة في المعرض", true) {
-                    captureCurrentFrameToGallery()
+                // استيراد وتخصيص ملف الترجمة (SRT / VTT)
+                val loadLabel = if (subtitleCues.isEmpty()) "إضافة ملف ترجمة (.SRT / .VTT)" else "ملف الترجمة: $subtitleFileName (${subtitleCues.size} سطر)"
+                row.addView(chipBtn(loadLabel, true) {
+                    pickSubtitleFileFromDevice()
                 })
+                if (subtitleCues.isNotEmpty()) {
+                    row.addView(chipBtn("حجم الخط: ${subtitleTextSizeSp.toInt()}") {
+                        subtitleTextSizeSp = when (subtitleTextSizeSp) {
+                            14f -> 16.5f
+                            16.5f -> 20f
+                            20f -> 24f
+                            else -> 14f
+                        }
+                        subtitleOverlayTv.textSize = subtitleTextSizeSp
+                        rebuildActiveToolPanel()
+                    })
+                    val colLabel = when (subtitleColorMode) {
+                        1 -> "لون الترجمة: أصفر سينمائي"
+                        2 -> "لون الترجمة: أزرق جليدي"
+                        else -> "لون الترجمة: أبيض ناصع"
+                    }
+                    row.addView(chipBtn(colLabel) {
+                        subtitleColorMode = (subtitleColorMode + 1) % 3
+                        subtitleOverlayTv.setTextColor(
+                            when (subtitleColorMode) {
+                                1 -> 0xFFFFD60A.toInt()
+                                2 -> colorBrandIceBlue
+                                else -> Color.WHITE
+                            }
+                        )
+                        rebuildActiveToolPanel()
+                    })
+                    row.addView(chipBtn("تقديم الترجمة -0.5s") {
+                        subtitleOffsetMs -= 500L
+                        Toast.makeText(this, "مزامنة الترجمة: ${subtitleOffsetMs}ms", Toast.LENGTH_SHORT).show()
+                    })
+                    row.addView(chipBtn("تأخير الترجمة +0.5s") {
+                        subtitleOffsetMs += 500L
+                        Toast.makeText(this, "مزامنة الترجمة: +${subtitleOffsetMs}ms", Toast.LENGTH_SHORT).show()
+                    })
+                    row.addView(chipBtn("إزالة الترجمة") {
+                        subtitleCues = emptyList()
+                        subtitleFileName = ""
+                        subtitleOverlayTv.visibility = View.GONE
+                        rebuildActiveToolPanel()
+                    })
+                }
+            }
+        }
+
+        scroll.addView(row)
+        toolPanelContainer.addView(scroll, LinearLayout.LayoutParams(-1, -2))
+    }
+
+    private fun pickSubtitleFileFromDevice() {
+        try {
+            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "*/*"
+            }
+            @Suppress("DEPRECATION")
+            startActivityForResult(intent, REQ_PICK_SUBTITLE)
+        } catch (_: Throwable) {
+            Toast.makeText(this, "تعذر فتح منتقي ملفات الترجمة", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    @Suppress("OVERRIDE_DEPRECATION", "DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQ_PICK_SUBTITLE && resultCode == RESULT_OK && data?.data != null) {
+            val subUri = data.data!!
+            var name = "subtitle.srt"
+            try {
+                contentResolver.query(subUri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                    if (c.moveToFirst()) name = c.getString(0) ?: name
+                }
+            } catch (_: Throwable) {}
+            io.execute {
+                val parsed = SubtitleParser.loadFromUri(this, subUri)
+                handler.post {
+                    if (parsed.isNotEmpty()) {
+                        subtitleCues = parsed
+                        subtitleFileName = name
+                        subtitleOffsetMs = 0L
+                        rebuildActiveToolPanel()
+                        Toast.makeText(this, "تم تحميل ملف الترجمة بنجاح (${parsed.size} جملة)", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(this, "لم يتم العثور على توقيتات ترجمة صالحة في الملف (يدعم SRT و VTT)", Toast.LENGTH_LONG).show()
+                    }
+                }
             }
         }
     }
@@ -555,50 +738,45 @@ class VideoEditorActivity : Activity() {
     private fun chipBtn(label: String, active: Boolean = false, onClick: () -> Unit): TextView =
         TextView(this).apply {
             text = label
-            textSize = 11.5f
+            textSize = 12f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(if (active) Color.WHITE else textPrimary)
-            background = if (active) roundBg(accent, 12f) else roundBg(bg, 12f, border)
-            setPadding(dp(10), dp(7), dp(10), dp(7))
-            val lp = LinearLayout.LayoutParams(-2, -2).apply {
-                leftMargin = dp(3)
-                rightMargin = dp(3)
+            background = if (active) roundBg(colorSamsungBlue, 16f) else roundBg(colorPureBlack, 16f, colorBorderSubtle)
+            setPadding(dp(14), dp(8), dp(14), dp(8))
+            layoutParams = LinearLayout.LayoutParams(-2, -2).apply {
+                leftMargin = dp(4)
+                rightMargin = dp(4)
             }
-            layoutParams = lp
             setOnClickListener { onClick() }
         }
 
-    private fun loadFilmstripThumbnails(uri: Uri) {
+    private fun loadFilmstripFrames(uri: Uri) {
         io.execute {
             val retriever = MediaMetadataRetriever()
+            val frames = ArrayList<Bitmap>()
             try {
                 retriever.setDataSource(this, uri)
                 val durStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                 val totalMs = durStr?.toLongOrNull() ?: 5000L
-                val count = 8
+                val count = 9
                 for (i in 0 until count) {
                     if (isFinishing) break
                     val timeUs = ((totalMs * i) / count) * 1000L
                     val rawBmp = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                     if (rawBmp != null) {
-                        val thumb = Bitmap.createScaledBitmap(rawBmp, dp(48), dp(48), true)
+                        val thumb = Bitmap.createScaledBitmap(rawBmp, dp(52), dp(56), true)
                         if (thumb !== rawBmp) rawBmp.recycle()
-                        handler.post {
-                            if (!isFinishing) {
-                                val iv = ImageView(this).apply {
-                                    scaleType = ImageView.ScaleType.CENTER_CROP
-                                    setImageBitmap(thumb)
-                                }
-                                filmstripRow.addView(iv, LinearLayout.LayoutParams(dp(46), dp(46)).apply {
-                                    rightMargin = dp(2)
-                                })
-                            }
-                        }
+                        frames.add(thumb)
                     }
                 }
             } catch (_: Throwable) {
             } finally {
                 try { retriever.release() } catch (_: Throwable) {}
+            }
+            handler.post {
+                if (!isFinishing && frames.isNotEmpty()) {
+                    timelineTrimView.setFrames(frames)
+                }
             }
         }
     }
@@ -636,17 +814,13 @@ class VideoEditorActivity : Activity() {
             handler.post {
                 Toast.makeText(
                     this,
-                    if (saved) "تم حفظ لقطة الإطار بدقة عالية في Mango Gallery 📸" else "تعذر استخراج اللقطة",
+                    if (saved) "تم حفظ لقطة الإطار بدقة عالية في Mango Gallery" else "تعذر استخراج اللقطة",
                     Toast.LENGTH_SHORT
                 ).show()
             }
         }
     }
 
-    /**
-     * تصدير الفيديو المعدل بسرعة فائقة عبر MediaExtractor + MediaMuxer بدون إعادة ترميز ثقيلة،
-     * مما يضمن عمله فوراً حتى على الهواتف الاقتصادية والضعيفة.
-     */
     private fun exportEditedVideo() {
         val uri = videoUri ?: return
         exporting = true
@@ -723,10 +897,9 @@ class VideoEditorActivity : Activity() {
                 muxer.release()
                 extractor.release()
 
-                // حفظ الملف الناتج في MediaStore تحت مجلد Movies/Mango Gallery
                 val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
                 val values = ContentValues().apply {
-                    put(MediaStore.Video.Media.DISPLAY_NAME, "MangoGallery_Edit_$ts.mp4")
+                    put(MediaStore.Video.Media.DISPLAY_NAME, "MangoGallery_Video_$ts.mp4")
                     put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                         put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/Mango Gallery")
@@ -757,7 +930,7 @@ class VideoEditorActivity : Activity() {
                 exportOverlay.visibility = View.GONE
                 if (isFinishing) return@post
                 if (success) {
-                    Toast.makeText(this, "تم تصدير وحفظ الفيديو الجديد في Mango Gallery بنجاح 🎬✨", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this, "تم تصدير وحفظ الفيديو المعدل في Mango Gallery بنجاح", Toast.LENGTH_LONG).show()
                     finish()
                 } else {
                     Toast.makeText(this, "تعذر تصدير هذا النطاق، جرّب توسيع مدة القص قليلاً", Toast.LENGTH_LONG).show()
@@ -771,5 +944,216 @@ class VideoEditorActivity : Activity() {
         handler.removeCallbacksAndMessages(null)
         try { videoView.stopPlayback() } catch (_: Throwable) {}
         io.shutdownNow()
+    }
+}
+
+/**
+ * مكوّن الشريط الزمني التفاعلي الموحد لمحرر الفيديو (Samsung Studio Interactive Video Timeline):
+ * - يعرض إطارات الفيديو المصغرة داخل مسار مستدير الحواف.
+ * - يظلل المناطق المقصوصة خارج نطاق (البداية .. النهاية) بطبقة داكنة شفافة.
+ * - يرسم إطاراً أزرق مضيئاً بمقبضي سحب سميكين على اليمين واليسار (Left/Right Trim Handles).
+ * - يرسم مؤشر التشغيل الأبيض العمودي (Playhead) مع إمكانية التمرير المباشر باللمس.
+ */
+class VideoTimelineTrimView(
+    context: Context,
+    private val onTimelineChanged: (startRatio: Float, endRatio: Float, seekRatio: Float, isDraggingHandle: Boolean) -> Unit
+) : View(context) {
+
+    private var frames: List<Bitmap> = emptyList()
+    private var startRatio = 0f
+    private var endRatio = 1f
+    private var playheadRatio = 0f
+    private var dragMode = 0 // 0=none, 1=left handle, 2=right handle, 3=playhead scrub
+
+    private val density = resources.displayMetrics.density
+    private fun dpF(v: Float): Float = v * density
+
+    private val trackBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFF101218.toInt()
+        style = Paint.Style.FILL
+    }
+    private val bmpPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+    private val dimScrimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xB8000000.toInt()
+        style = Paint.Style.FILL
+    }
+    private val activeBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFF0A78D6.toInt()
+        style = Paint.Style.STROKE
+        strokeWidth = dpF(3f)
+    }
+    private val handleFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFF0A78D6.toInt()
+        style = Paint.Style.FILL
+    }
+    private val handleGripPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        style = Paint.Style.STROKE
+        strokeWidth = dpF(2f)
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val playheadPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        style = Paint.Style.STROKE
+        strokeWidth = dpF(2.8f)
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val playheadKnobPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFF8CD0FA.toInt()
+        style = Paint.Style.FILL
+    }
+
+    private val trackRect = RectF()
+    private val tempRect = RectF()
+    private val clipPath = Path()
+
+    fun setFrames(list: List<Bitmap>) {
+        frames = list
+        invalidate()
+    }
+
+    fun setRange(start: Float, end: Float, playhead: Float) {
+        startRatio = start.coerceIn(0f, 0.95f)
+        endRatio = end.coerceIn(startRatio + 0.05f, 1f)
+        playheadRatio = playhead.coerceIn(startRatio, endRatio)
+        invalidate()
+    }
+
+    fun updatePlayhead(ratio: Float) {
+        if (dragMode == 0) {
+            playheadRatio = ratio.coerceIn(startRatio, endRatio)
+            invalidate()
+        }
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val w = width.toFloat()
+        val h = height.toFloat()
+        if (w <= 0f || h <= 0f) return
+
+        val handleW = dpF(14f)
+        val padTop = dpF(6f)
+        val padBottom = dpF(6f)
+        val trackLeft = handleW
+        val trackRight = w - handleW
+        val trackW = (trackRight - trackLeft).coerceAtLeast(1f)
+
+        trackRect.set(trackLeft, padTop, trackRight, h - padBottom)
+        clipPath.reset()
+        clipPath.addRoundRect(trackRect, dpF(10f), dpF(10f), Path.Direction.CW)
+
+        canvas.save()
+        canvas.clipPath(clipPath)
+        canvas.drawRect(trackRect, trackBgPaint)
+
+        // رسم الإطارات المصغرة على طول المسار
+        if (frames.isNotEmpty()) {
+            val cellW = trackW / frames.size
+            for (i in frames.indices) {
+                val bmp = frames[i]
+                if (!bmp.isRecycled) {
+                    val cl = trackLeft + i * cellW
+                    tempRect.set(cl, trackRect.top, cl + cellW + 1f, trackRect.bottom)
+                    canvas.drawBitmap(bmp, null, tempRect, bmpPaint)
+                }
+            }
+        }
+
+        val selLeft = trackLeft + startRatio * trackW
+        val selRight = trackLeft + endRatio * trackW
+
+        // تعتيم المناطق المقصوصة على اليسار واليمين
+        if (selLeft > trackLeft) {
+            tempRect.set(trackLeft, trackRect.top, selLeft, trackRect.bottom)
+            canvas.drawRect(tempRect, dimScrimPaint)
+        }
+        if (selRight < trackRight) {
+            tempRect.set(selRight, trackRect.top, trackRight, trackRect.bottom)
+            canvas.drawRect(tempRect, dimScrimPaint)
+        }
+        canvas.restore()
+
+        val selLeft2 = trackLeft + startRatio * trackW
+        val selRight2 = trackLeft + endRatio * trackW
+
+        // الإطار المحيط بمنطقة القص النشطة
+        tempRect.set(selLeft2, trackRect.top, selRight2, trackRect.bottom)
+        canvas.drawRoundRect(tempRect, dpF(8f), dpF(8f), activeBorderPaint)
+
+        // مقبض السحب الأيسر
+        tempRect.set(selLeft2 - handleW, trackRect.top, selLeft2 + dpF(2f), trackRect.bottom)
+        canvas.drawRoundRect(tempRect, dpF(8f), dpF(8f), handleFillPaint)
+        val gripCy = trackRect.centerY()
+        val leftGripX = tempRect.centerX()
+        canvas.drawLine(leftGripX, gripCy - dpF(8f), leftGripX, gripCy + dpF(8f), handleGripPaint)
+
+        // مقبض السحب الأيمن
+        tempRect.set(selRight2 - dpF(2f), trackRect.top, selRight2 + handleW, trackRect.bottom)
+        canvas.drawRoundRect(tempRect, dpF(8f), dpF(8f), handleFillPaint)
+        val rightGripX = tempRect.centerX()
+        canvas.drawLine(rightGripX, gripCy - dpF(8f), rightGripX, gripCy + dpF(8f), handleGripPaint)
+
+        // مؤشر التشغيل الحي (Playhead)
+        val px = trackLeft + playheadRatio.coerceIn(startRatio, endRatio) * trackW
+        canvas.drawLine(px, dpF(2f), px, h - dpF(2f), playheadPaint)
+        canvas.drawCircle(px, dpF(5f), dpF(4.5f), playheadKnobPaint)
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        val handleW = dpF(14f)
+        val trackLeft = handleW
+        val trackRight = width.toFloat() - handleW
+        val trackW = (trackRight - trackLeft).coerceAtLeast(1f)
+        val x = event.x
+
+        val selLeft = trackLeft + startRatio * trackW
+        val selRight = trackLeft + endRatio * trackW
+        val hitSlop = dpF(26f)
+
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                dragMode = when {
+                    abs(x - selLeft) <= hitSlop -> 1
+                    abs(x - selRight) <= hitSlop -> 2
+                    else -> 3
+                }
+                parent?.requestDisallowInterceptTouchEvent(true)
+                handleTouchMove(x, trackLeft, trackW)
+                return true
+            }
+            MotionEvent.ACTION_MOVE -> {
+                handleTouchMove(x, trackLeft, trackW)
+                return true
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                dragMode = 0
+                invalidate()
+                return true
+            }
+        }
+        return super.onTouchEvent(event)
+    }
+
+    private fun handleTouchMove(x: Float, trackLeft: Float, trackW: Float) {
+        val norm = ((x - trackLeft) / trackW).coerceIn(0f, 1f)
+        val minGap = 0.05f
+        when (dragMode) {
+            1 -> {
+                startRatio = norm.coerceIn(0f, endRatio - minGap)
+                playheadRatio = startRatio
+                onTimelineChanged(startRatio, endRatio, playheadRatio, true)
+            }
+            2 -> {
+                endRatio = norm.coerceIn(startRatio + minGap, 1f)
+                playheadRatio = endRatio
+                onTimelineChanged(startRatio, endRatio, playheadRatio, true)
+            }
+            3 -> {
+                playheadRatio = norm.coerceIn(startRatio, endRatio)
+                onTimelineChanged(startRatio, endRatio, playheadRatio, false)
+            }
+        }
+        invalidate()
     }
 }

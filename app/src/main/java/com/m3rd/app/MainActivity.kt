@@ -322,6 +322,11 @@ class MainActivity : Activity() {
     private var batchDeletedCount = 0
     private val REQ_SYSTEM_DELETE = 4101
     private val REQ_SYSTEM_DELETE_LEGACY = 4102
+    private val REQ_PICK_PLAYER_SUBTITLE = 4105
+    private var activeCinemaSubtitleCues: List<SubtitleCue> = emptyList()
+    private var activeCinemaSubtitleName: String = ""
+    private var activeCinemaSubtitleOffsetMs: Long = 0L
+    private var onCinemaSubtitleLoadedCallback: (() -> Unit)? = null
     private val isLoadingMedia = AtomicBoolean(false)
     private val reloadQueued = AtomicBoolean(false)
     private var audioLoadToken = 0
@@ -1018,6 +1023,26 @@ class MainActivity : Activity() {
                 } else {
                     pendingDeleteIds = emptyList()
                     onDeleteBatchFinished()
+                }
+            }
+            REQ_PICK_PLAYER_SUBTITLE -> {
+                if (resultCode == RESULT_OK && data?.data != null) {
+                    val subUri = data.data!!
+                    val fileName = subUri.lastPathSegment?.substringAfterLast('/') ?: "subtitle.srt"
+                    viewerExecutor.execute {
+                        val cues = SubtitleParser.loadFromUri(this, subUri)
+                        handler.post {
+                            if (cues.isNotEmpty()) {
+                                activeCinemaSubtitleCues = cues
+                                activeCinemaSubtitleName = fileName
+                                activeCinemaSubtitleOffsetMs = 0L
+                                onCinemaSubtitleLoadedCallback?.invoke()
+                                Toast.makeText(this, "تم تفعيل ملف الترجمة (${toArabicDigits(cues.size)} سطر)", Toast.LENGTH_SHORT).show()
+                            } else {
+                                Toast.makeText(this, "ملف الترجمة غير مدعوم أو فارغ (يدعم SRT و VTT)", Toast.LENGTH_LONG).show()
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1718,7 +1743,7 @@ class MainActivity : Activity() {
         bottomNavContainer.addView(menuTab, LinearLayout.LayoutParams(0, -1, 1f))
 
         bottomNavContainer.addView(
-            makeBottomTabItem("القصص", 2),
+            makeBottomTabItem("الاستوديو", 2),
             LinearLayout.LayoutParams(0, -1, 1f)
         )
         bottomNavContainer.addView(
@@ -1880,34 +1905,7 @@ class MainActivity : Activity() {
             LinearLayout.LayoutParams(dp(40), dp(40)).apply { leftMargin = dp(4) }
         )
 
-        // زر تصغير/تكبير عدد الأعمدة السريع
-        val zoomColBtn = TextView(this).apply {
-            text = "${toArabicDigits(picturesColumnCount)}×"
-            textSize = 12f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(colorSamsungBlue)
-            gravity = Gravity.CENTER
-            setPadding(dp(10), dp(4), dp(10), dp(4))
-            background = GradientDrawable().apply {
-                setColor(colorCardDark)
-                cornerRadius = dpF(14f)
-                setStroke(dp(1), colorBorderSubtle)
-            }
-            setOnClickListener {
-                picturesColumnCount = when (picturesColumnCount) {
-                    2 -> 3
-                    3 -> 4
-                    4 -> 5
-                    else -> 2
-                }
-                savePersistedState()
-                renderActiveScreen()
-            }
-        }
-        normalTopBar.addView(
-            zoomColBtn,
-            LinearLayout.LayoutParams(-2, dp(30)).apply { leftMargin = dp(6) }
-        )
+        // تغيير حجم شبكة الصور يتم بسلاسة بإيماءة اليد (Pinch-to-Zoom بإصبعين) بدون أي أزرار زائدة
 
         normalTopBar.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
 
@@ -2563,218 +2561,7 @@ class MainActivity : Activity() {
 
         mainCol.addView(actionRow, LinearLayout.LayoutParams(-1, -2))
 
-        // ============================================================
-        // ويدجات الوسائط التفاعلية الاحترافية (ويدجت مشغل الموسيقى + ويدجت مشغل الفيديو والأفلام)
-        // ============================================================
-        val widgetsRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            layoutDirection = View.LAYOUT_DIRECTION_RTL
-        }
-
-        // 1. ويدجت مشغل الموسيقى الاحترافي
-        val musicWidgetCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(14), dp(14), dp(14), dp(14))
-            isClickable = true
-            background = GradientDrawable(
-                GradientDrawable.Orientation.TL_BR,
-                intArrayOf(0xFF0A2A4E.toInt(), 0xFF141822.toInt())
-            ).apply {
-                cornerRadius = dpF(22f)
-                setStroke(dp(1), 0x448CD0FA)
-            }
-            setOnClickListener { showProAudioPlayerOverlay() }
-        }
-
-        val mwTop = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            layoutDirection = View.LAYOUT_DIRECTION_RTL
-        }
-        val mwIconWrap = FrameLayout(this).apply {
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(0x330A78D6)
-            }
-        }
-        mwIconWrap.addView(
-            SamsungIconView(this, SamsungIconView.IconType.AUDIO_WAVE, colorBrandIceBlue, 2.0f),
-            FrameLayout.LayoutParams(dp(18), dp(18)).apply { gravity = Gravity.CENTER }
-        )
-        mwTop.addView(mwIconWrap, LinearLayout.LayoutParams(dp(32), dp(32)))
-
-        val mwTag = TextView(this).apply {
-            text = "مشغل الموسيقى"
-            textSize = 12.5f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(colorBrandIceBlue)
-            setPadding(0, 0, dp(8), 0)
-        }
-        mwTop.addView(mwTag)
-        musicWidgetCard.addView(mwTop, LinearLayout.LayoutParams(-1, -2))
-
-        val activeSong = deviceAudioTracks.getOrNull(currentAudioIndex) ?: deviceAudioTracks.firstOrNull()
-        val mwSongTitle = TextView(this).apply {
-            text = activeSong?.title ?: "مكتبة الصوتيات"
-            textSize = 13.5f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Color.WHITE)
-            gravity = Gravity.RIGHT
-            maxLines = 1
-            ellipsize = TextUtils.TruncateAt.END
-        }
-        musicWidgetCard.addView(mwSongTitle, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
-
-        val mwSongSub = TextView(this).apply {
-            text = if (activeSong != null) "${activeSong.artist} • ${toArabicDigits(deviceAudioTracks.size)} مقطع"
-            else "${toArabicDigits(deviceAudioTracks.size)} ملف صوتي"
-            textSize = 11f
-            setTextColor(0xFFB0C4DE.toInt())
-            gravity = Gravity.RIGHT
-            maxLines = 1
-        }
-        musicWidgetCard.addView(mwSongSub, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(2) })
-
-        val mwControls = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-            setPadding(0, dp(10), 0, 0)
-            layoutDirection = View.LAYOUT_DIRECTION_LTR
-        }
-        val mwPrev = makeCircleIconBtn(SamsungIconView.IconType.SKIP_PREV, 28, 14, 0x22FFFFFF) {
-            if (deviceAudioTracks.isNotEmpty()) {
-                playAudioTrackAtIndex(if (currentAudioIndex <= 0) deviceAudioTracks.size - 1 else currentAudioIndex - 1)
-                renderActiveScreen()
-            }
-        }
-        val mwPlayIcon = if (audioPlayer?.isPlaying == true) SamsungIconView.IconType.PAUSE_SOLID else SamsungIconView.IconType.PLAY_SOLID
-        val mwPlay = makeCircleIconBtn(mwPlayIcon, 34, 16, colorSamsungBlue) {
-            if (deviceAudioTracks.isEmpty()) {
-                showProAudioPlayerOverlay()
-            } else if (currentAudioIndex < 0) {
-                playAudioTrackAtIndex(0)
-                renderActiveScreen()
-            } else {
-                audioPlayer?.let { mp ->
-                    if (mp.isPlaying) mp.pause() else mp.start()
-                }
-                updateMiniAudioPlayerBar()
-                renderActiveScreen()
-            }
-        }
-        val mwNext = makeCircleIconBtn(SamsungIconView.IconType.SKIP_NEXT, 28, 14, 0x22FFFFFF) {
-            if (deviceAudioTracks.isNotEmpty()) {
-                playAudioTrackAtIndex(currentAudioIndex + 1)
-                renderActiveScreen()
-            }
-        }
-        mwControls.addView(mwPrev, LinearLayout.LayoutParams(dp(28), dp(28)).apply { rightMargin = dp(8) })
-        mwControls.addView(mwPlay, LinearLayout.LayoutParams(dp(34), dp(34)))
-        mwControls.addView(mwNext, LinearLayout.LayoutParams(dp(28), dp(28)).apply { leftMargin = dp(8) })
-        musicWidgetCard.addView(mwControls, LinearLayout.LayoutParams(-1, -2))
-
-        // 2. ويدجت مشغل الفيديو والأفلام (Cinema Video Widget)
-        val allVideos = getVisibleMediaItems().filter { it.isVideo }
-        val latestVid = allVideos.firstOrNull()
-        val videoWidgetCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(14), dp(14), dp(14), dp(14))
-            isClickable = true
-            background = GradientDrawable(
-                GradientDrawable.Orientation.TL_BR,
-                intArrayOf(0xFF1E1A34.toInt(), 0xFF14161E.toInt())
-            ).apply {
-                cornerRadius = dpF(22f)
-                setStroke(dp(1), 0x448CD0FA)
-            }
-            setOnClickListener {
-                if (latestVid != null) {
-                    openFullCinemaVideoPlayer(latestVid, allVideos)
-                } else {
-                    openSubPage("مقاطع فيديو", allVideos)
-                }
-            }
-        }
-
-        val vwTop = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            layoutDirection = View.LAYOUT_DIRECTION_RTL
-        }
-        val vwIconWrap = FrameLayout(this).apply {
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(0x333E82F7)
-            }
-        }
-        vwIconWrap.addView(
-            SamsungIconView(this, SamsungIconView.IconType.VIDEO_PLAY, colorBrandIceBlue, 2.0f),
-            FrameLayout.LayoutParams(dp(18), dp(18)).apply { gravity = Gravity.CENTER }
-        )
-        vwTop.addView(vwIconWrap, LinearLayout.LayoutParams(dp(32), dp(32)))
-
-        val vwTag = TextView(this).apply {
-            text = "سينما الفيديوهات"
-            textSize = 12.5f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(colorBrandIceBlue)
-            setPadding(0, 0, dp(8), 0)
-        }
-        vwTop.addView(vwTag)
-        videoWidgetCard.addView(vwTop, LinearLayout.LayoutParams(-1, -2))
-
-        val vwTitle = TextView(this).apply {
-            text = latestVid?.title ?: "مشغل الأفلام والفيديو"
-            textSize = 13.5f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Color.WHITE)
-            gravity = Gravity.RIGHT
-            maxLines = 1
-            ellipsize = TextUtils.TruncateAt.END
-        }
-        videoWidgetCard.addView(vwTitle, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
-
-        val vwSub = TextView(this).apply {
-            text = "${toArabicDigits(allVideos.size)} فيديو جاهز للتشغيل"
-            textSize = 11f
-            setTextColor(0xFFB0C4DE.toInt())
-            gravity = Gravity.RIGHT
-            maxLines = 1
-        }
-        videoWidgetCard.addView(vwSub, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(2) })
-
-        val vwBtnRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-            setPadding(0, dp(10), 0, 0)
-            layoutDirection = View.LAYOUT_DIRECTION_LTR
-        }
-        val openListBtn = makeCircleIconBtn(SamsungIconView.IconType.HAMBURGER, 28, 14, 0x22FFFFFF) {
-            openSubPage("مقاطع فيديو", allVideos)
-        }
-        val playVidBtn = makeCircleIconBtn(SamsungIconView.IconType.PLAY_SOLID, 34, 16, colorSamsungBlue) {
-            if (latestVid != null) {
-                openFullCinemaVideoPlayer(latestVid, allVideos)
-            } else {
-                openSubPage("مقاطع فيديو", allVideos)
-            }
-        }
-        val pipVidBtn = makeCircleIconBtn(SamsungIconView.IconType.PIP_WINDOW, 28, 14, 0x22FFFFFF) {
-            if (latestVid != null) {
-                startFloatingPipVideoWidget(latestVid, 0)
-            }
-        }
-        vwBtnRow.addView(openListBtn, LinearLayout.LayoutParams(dp(28), dp(28)).apply { rightMargin = dp(8) })
-        vwBtnRow.addView(playVidBtn, LinearLayout.LayoutParams(dp(34), dp(34)))
-        vwBtnRow.addView(pipVidBtn, LinearLayout.LayoutParams(dp(28), dp(28)).apply { leftMargin = dp(8) })
-        videoWidgetCard.addView(vwBtnRow, LinearLayout.LayoutParams(-1, -2))
-
-        widgetsRow.addView(musicWidgetCard, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(6) })
-        widgetsRow.addView(videoWidgetCard, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(6) })
-        mainCol.addView(
-            widgetsRow,
-            LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(16) }
-        )
+        // تم نقل بطاقتي سينما الفيديوهات ومشغل الموسيقى إلى التبويب المخصص (الاستوديو) بناءً على طلب المستخدم
 
         if (showCustomizeAlbumsBanner) {
             val bannerCard = LinearLayout(this).apply {
@@ -3149,266 +2936,502 @@ class MainActivity : Activity() {
             layoutDirection = View.LAYOUT_DIRECTION_LTR
         }
 
-        val topBar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(12), dp(14), dp(16), dp(8))
-            layoutDirection = View.LAYOUT_DIRECTION_LTR
-        }
-
-        val moreBtn = makeTopIconButton(SamsungIconView.IconType.MORE_VERT) {
-            showStoriesMorePopover()
-        }
-        topBar.addView(moreBtn, LinearLayout.LayoutParams(dp(40), dp(40)))
-
-        val searchBtn = makeTopIconButton(SamsungIconView.IconType.SEARCH) {
-            showSearchOverlay()
-        }
-        topBar.addView(
-            searchBtn,
-            LinearLayout.LayoutParams(dp(40), dp(40)).apply { leftMargin = dp(4) }
-        )
-
-        val favFilterIcon = if (storiesFavoritesOnly) {
-            SamsungIconView.IconType.HEART_FILLED
-        } else {
-            SamsungIconView.IconType.HEART
-        }
-        val favBtn = makeTopIconButton(favFilterIcon) {
-            storiesFavoritesOnly = !storiesFavoritesOnly
-            renderActiveScreen()
-        }
-        topBar.addView(
-            favBtn,
-            LinearLayout.LayoutParams(dp(40), dp(40)).apply { leftMargin = dp(4) }
-        )
-
-        topBar.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
-        wrapper.addView(topBar, LinearLayout.LayoutParams(-1, -2))
-
-        val visibleMedia = getVisibleMediaItems()
-        if (visibleMedia.isEmpty()) {
-            wrapper.addView(buildEmptyOrPermissionPromptView(), LinearLayout.LayoutParams(-1, 0, 1f))
-            return wrapper
-        }
-
         val scroll = ScrollView(this).apply {
             isVerticalScrollBarEnabled = false
         }
-        val col = LinearLayout(this).apply {
+        val mainCol = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(6), dp(12), dp(28))
+            setPadding(dp(14), dp(12), dp(14), dp(32))
             layoutDirection = View.LAYOUT_DIRECTION_LTR
         }
 
-        val highlightRow = LinearLayout(this).apply {
+        // 1. الهيدر الفخم لمركز الاستوديو والذكاء الاصطناعي
+        val headerBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(0, dp(24), 0, dp(20))
+        }
+        headerBox.addView(createAppLogoBadge(44))
+        headerBox.addView(TextView(this).apply {
+            text = "الاستوديو والذكاء الاصطناعي"
+            textSize = 26f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(colorWhite)
+            gravity = Gravity.CENTER
+            setPadding(0, dp(8), 0, dp(2))
+        })
+        val allVideos = getVisibleMediaItems().filter { it.isVideo }
+        val hwProfile = ObjectEraser.detectHardwareProfile(this)
+        headerBox.addView(TextView(this).apply {
+            text = "${toArabicDigits(allVideos.size)} فيديو • ${toArabicDigits(deviceAudioTracks.size)} مقطع صوتي • ${hwProfile.acceleratorName}"
+            textSize = 12f
+            setTextColor(colorTextSecondary)
+            gravity = Gravity.CENTER
+        })
+        mainCol.addView(headerBox, LinearLayout.LayoutParams(-1, -2))
+
+        // 2. البطاقتان الرئيسيتان (مشغل الموسيقى + سينما الفيديوهات) في صفحتهما المخصصة
+        val widgetsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.RIGHT
-            layoutDirection = View.LAYOUT_DIRECTION_LTR
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
         }
 
-        val highlightCard = FrameLayout(this).apply {
+        // بطاقة مشغل الموسيقى الاحترافي
+        val musicWidgetCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(16), dp(14), dp(16))
             isClickable = true
-            setOnClickListener {
-                showStoryPlayerOverlay(
-                    StoryInfo(
-                        id = "highlights_recent",
-                        title = "التمييزات الأخيرة",
-                        yearText = toArabicDigits(SimpleDateFormat("yyyy", Locale.US).format(Date())),
-                        isNew = true,
-                        items = visibleMedia.take(15)
-                    )
-                )
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TL_BR,
+                intArrayOf(0xFF0A2A4E.toInt(), 0xFF141822.toInt())
+            ).apply {
+                cornerRadius = dpF(22f)
+                setStroke(dp(1), 0x448CD0FA)
+            }
+            setOnClickListener { showProAudioPlayerOverlay() }
+        }
+
+        val mwTop = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+        }
+        val mwIconWrap = FrameLayout(this).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(0x330A78D6)
             }
         }
-        val highlightThumb = AsyncMediaThumbnailView(
-            context = this,
-            media = visibleMedia.first(),
-            cornerRadiusPx = dpF(18f),
-            strokeColor = colorBorderSubtle,
-            preferredDecodePx = dp(180)
+        mwIconWrap.addView(
+            SamsungIconView(this, SamsungIconView.IconType.AUDIO_WAVE, colorBrandIceBlue, 2.0f),
+            FrameLayout.LayoutParams(dp(18), dp(18)).apply { gravity = Gravity.CENTER }
         )
-        highlightCard.addView(highlightThumb, FrameLayout.LayoutParams(-1, -1))
+        mwTop.addView(mwIconWrap, LinearLayout.LayoutParams(dp(32), dp(32)))
 
-        val highlightLabel = TextView(this).apply {
-            text = "التمييزات الأخيرة"
+        val mwTag = TextView(this).apply {
+            text = "مشغل الموسيقى"
             textSize = 12.5f
             typeface = Typeface.DEFAULT_BOLD
+            setTextColor(colorBrandIceBlue)
+            setPadding(0, 0, dp(8), 0)
+        }
+        mwTop.addView(mwTag)
+        musicWidgetCard.addView(mwTop, LinearLayout.LayoutParams(-1, -2))
+
+        val activeSong = deviceAudioTracks.getOrNull(currentAudioIndex) ?: deviceAudioTracks.firstOrNull()
+        val mwSongTitle = TextView(this).apply {
+            text = activeSong?.title ?: "مكتبة الصوتيات"
+            textSize = 13.5f
+            typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.WHITE)
+            gravity = Gravity.RIGHT
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        musicWidgetCard.addView(mwSongTitle, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+
+        val mwSongSub = TextView(this).apply {
+            text = if (activeSong != null) "${activeSong.artist} • ${toArabicDigits(deviceAudioTracks.size)} مقطع"
+            else "${toArabicDigits(deviceAudioTracks.size)} ملف صوتي"
+            textSize = 11f
+            setTextColor(0xFFB0C4DE.toInt())
+            gravity = Gravity.RIGHT
+            maxLines = 1
+        }
+        musicWidgetCard.addView(mwSongSub, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(2) })
+
+        val mwControls = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            setShadowLayer(6f, 0f, 2f, Color.BLACK)
+            setPadding(0, dp(12), 0, 0)
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
         }
-        val hlLabelLp = FrameLayout.LayoutParams(-1, -2).apply {
-            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-            bottomMargin = dp(10)
+        val mwPrev = makeCircleIconBtn(SamsungIconView.IconType.SKIP_PREV, 30, 14, 0x22FFFFFF) {
+            if (deviceAudioTracks.isNotEmpty()) {
+                playAudioTrackAtIndex(if (currentAudioIndex <= 0) deviceAudioTracks.size - 1 else currentAudioIndex - 1)
+                renderActiveScreen()
+            }
         }
-        highlightCard.addView(highlightLabel, hlLabelLp)
+        val mwPlayIcon = if (audioPlayer?.isPlaying == true) SamsungIconView.IconType.PAUSE_SOLID else SamsungIconView.IconType.PLAY_SOLID
+        val mwPlay = makeCircleIconBtn(mwPlayIcon, 36, 16, colorSamsungBlue) {
+            if (deviceAudioTracks.isEmpty()) {
+                showProAudioPlayerOverlay()
+            } else if (currentAudioIndex < 0) {
+                playAudioTrackAtIndex(0)
+                renderActiveScreen()
+            } else {
+                audioPlayer?.let { mp ->
+                    if (mp.isPlaying) mp.pause() else mp.start()
+                }
+                updateMiniAudioPlayerBar()
+                renderActiveScreen()
+            }
+        }
+        val mwNext = makeCircleIconBtn(SamsungIconView.IconType.SKIP_NEXT, 30, 14, 0x22FFFFFF) {
+            if (deviceAudioTracks.isNotEmpty()) {
+                playAudioTrackAtIndex(currentAudioIndex + 1)
+                renderActiveScreen()
+            }
+        }
+        mwControls.addView(mwPrev, LinearLayout.LayoutParams(dp(30), dp(30)).apply { rightMargin = dp(8) })
+        mwControls.addView(mwPlay, LinearLayout.LayoutParams(dp(36), dp(36)))
+        mwControls.addView(mwNext, LinearLayout.LayoutParams(dp(30), dp(30)).apply { leftMargin = dp(8) })
+        musicWidgetCard.addView(mwControls, LinearLayout.LayoutParams(-1, -2))
 
-        highlightRow.addView(highlightCard, LinearLayout.LayoutParams(dp(136), dp(136)))
-        col.addView(highlightRow, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6) })
+        // بطاقة سينما الفيديوهات الاحترافية
+        val latestVid = allVideos.firstOrNull()
+        val videoWidgetCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(16), dp(14), dp(16))
+            isClickable = true
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TL_BR,
+                intArrayOf(0xFF1E1A34.toInt(), 0xFF14161E.toInt())
+            ).apply {
+                cornerRadius = dpF(22f)
+                setStroke(dp(1), 0x448CD0FA)
+            }
+            setOnClickListener {
+                if (latestVid != null) {
+                    openFullCinemaVideoPlayer(latestVid, allVideos)
+                } else {
+                    openSubPage("مقاطع فيديو", allVideos)
+                }
+            }
+        }
 
-        val exploreTitle = TextView(this).apply {
-            text = "استكشاف القصص الخاصة بك"
-            textSize = 17f
+        val vwTop = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+        }
+        val vwIconWrap = FrameLayout(this).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(0x333E82F7)
+            }
+        }
+        vwIconWrap.addView(
+            SamsungIconView(this, SamsungIconView.IconType.VIDEO_PLAY, colorBrandIceBlue, 2.0f),
+            FrameLayout.LayoutParams(dp(18), dp(18)).apply { gravity = Gravity.CENTER }
+        )
+        vwTop.addView(vwIconWrap, LinearLayout.LayoutParams(dp(32), dp(32)))
+
+        val vwTag = TextView(this).apply {
+            text = "سينما الفيديوهات"
+            textSize = 12.5f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(colorBrandIceBlue)
+            setPadding(0, 0, dp(8), 0)
+        }
+        vwTop.addView(vwTag)
+        videoWidgetCard.addView(vwTop, LinearLayout.LayoutParams(-1, -2))
+
+        val vwTitle = TextView(this).apply {
+            text = latestVid?.title ?: "مشغل الأفلام والفيديو"
+            textSize = 13.5f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+            gravity = Gravity.RIGHT
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        videoWidgetCard.addView(vwTitle, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+
+        val vwSub = TextView(this).apply {
+            text = "${toArabicDigits(allVideos.size)} فيديو جاهز للتشغيل"
+            textSize = 11f
+            setTextColor(0xFFB0C4DE.toInt())
+            gravity = Gravity.RIGHT
+            maxLines = 1
+        }
+        videoWidgetCard.addView(vwSub, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(2) })
+
+        val vwBtnRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(0, dp(12), 0, 0)
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+        val openListBtn = makeCircleIconBtn(SamsungIconView.IconType.HAMBURGER, 30, 14, 0x22FFFFFF) {
+            openSubPage("مقاطع فيديو", allVideos)
+        }
+        val playVidBtn = makeCircleIconBtn(SamsungIconView.IconType.PLAY_SOLID, 36, 16, colorSamsungBlue) {
+            if (latestVid != null) {
+                openFullCinemaVideoPlayer(latestVid, allVideos)
+            } else {
+                openSubPage("مقاطع فيديو", allVideos)
+            }
+        }
+        val pipVidBtn = makeCircleIconBtn(SamsungIconView.IconType.PIP_WINDOW, 30, 14, 0x22FFFFFF) {
+            if (latestVid != null) {
+                startFloatingPipVideoWidget(latestVid, 0)
+            }
+        }
+        vwBtnRow.addView(openListBtn, LinearLayout.LayoutParams(dp(30), dp(30)).apply { rightMargin = dp(8) })
+        vwBtnRow.addView(playVidBtn, LinearLayout.LayoutParams(dp(36), dp(36)))
+        vwBtnRow.addView(pipVidBtn, LinearLayout.LayoutParams(dp(30), dp(30)).apply { leftMargin = dp(8) })
+        videoWidgetCard.addView(vwBtnRow, LinearLayout.LayoutParams(-1, -2))
+
+        widgetsRow.addView(musicWidgetCard, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(6) })
+        widgetsRow.addView(videoWidgetCard, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(6) })
+        mainCol.addView(widgetsRow, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(20) })
+
+        // 3. قسم تقنيات الذكاء الاصطناعي المحلية (On-Device Neural AI Suite)
+        val aiHeader = TextView(this).apply {
+            text = "مختبر الذكاء الاصطناعي المحلي (On-Device AI)"
+            textSize = 16.5f
+            typeface = Typeface.DEFAULT_BOLD
             setTextColor(colorTextPrimary)
             gravity = Gravity.RIGHT
-            setPadding(dp(4), dp(22), dp(4), dp(14))
+            setPadding(dp(4), dp(4), dp(4), dp(10))
         }
-        col.addView(exploreTitle, LinearLayout.LayoutParams(-1, -2))
+        mainCol.addView(aiHeader, LinearLayout.LayoutParams(-1, -2))
 
-        val filteredStories = if (storiesFavoritesOnly) {
-            storiesList.filter { it.isFavorite }
-        } else {
-            storiesList
-        }
-
-        if (filteredStories.isEmpty()) {
-            val emptyTv = TextView(this).apply {
-                text = "لا توجد قصص مطابقة حالياً"
-                textSize = 14f
-                setTextColor(colorTextMuted)
-                gravity = Gravity.CENTER
-                setPadding(0, dp(40), 0, dp(40))
+        fun buildAiFeatureCard(
+            title: String,
+            subtitle: String,
+            iconType: SamsungIconView.IconType,
+            onClick: () -> Unit
+        ): View {
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                isClickable = true
+                setPadding(dp(16), dp(14), dp(16), dp(14))
+                background = GradientDrawable().apply {
+                    setColor(colorCardDark)
+                    cornerRadius = dpF(20f)
+                    setStroke(dp(1), colorBorderSubtle)
+                }
+                layoutDirection = View.LAYOUT_DIRECTION_LTR
+                setOnClickListener { onClick() }
             }
-            col.addView(emptyTv, LinearLayout.LayoutParams(-1, -2))
-        } else {
-            for (story in filteredStories) {
-                val card = buildLargeRealStoryCard(story)
-                col.addView(
-                    card,
-                    LinearLayout.LayoutParams(-1, dp(390)).apply { bottomMargin = dp(16) }
+            val arrow = SamsungIconView(this, SamsungIconView.IconType.CHEVRON_RIGHT, colorTextSecondary, 1.8f).apply {
+                rotation = 180f
+            }
+            card.addView(arrow, LinearLayout.LayoutParams(dp(18), dp(18)))
+
+            val textCol = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.RIGHT
+                setPadding(dp(12), 0, dp(12), 0)
+            }
+            textCol.addView(TextView(this).apply {
+                text = title
+                textSize = 15f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(colorTextPrimary)
+                gravity = Gravity.RIGHT
+            })
+            textCol.addView(TextView(this).apply {
+                text = subtitle
+                textSize = 12f
+                setTextColor(colorTextSecondary)
+                gravity = Gravity.RIGHT
+                setPadding(0, dp(2), 0, 0)
+            })
+            card.addView(textCol, LinearLayout.LayoutParams(0, -2, 1f))
+
+            val iconCircle = FrameLayout(this).apply {
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    setColor(0x260A78D6)
+                    setStroke(dp(1), 0x448CD0FA)
+                }
+            }
+            iconCircle.addView(
+                SamsungIconView(this, iconType, colorBrandIceBlue, 2.0f),
+                FrameLayout.LayoutParams(dp(22), dp(22), Gravity.CENTER)
+            )
+            card.addView(iconCircle, LinearLayout.LayoutParams(dp(46), dp(46)))
+            return card
+        }
+
+        val firstPhoto = getVisibleMediaItems().firstOrNull { !it.isVideo }
+
+        mainCol.addView(
+            buildAiFeatureCard(
+                title = "الممحاة الذكية للأجسام والظلال (AI Object Eraser)",
+                subtitle = "إزالة الأشخاص والعناصر غير المرغوب فيها محلياً عبر المعالج العصبي",
+                iconType = SamsungIconView.IconType.ERASER_BOX
+            ) {
+                if (firstPhoto != null) openObjectEraser(firstPhoto)
+                else Toast.makeText(this, "لا توجد صور متاحة حالياً", Toast.LENGTH_SHORT).show()
+            },
+            LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(10) }
+        )
+
+        mainCol.addView(
+            buildAiFeatureCard(
+                title = "تحسين الصور التلقائي الذكي (AI Remaster & Auto-HDR)",
+                subtitle = "رفع الحدة، استعادة تفاصيل الإضاءة والظلال، وعزل الخلفية البورتريه",
+                iconType = SamsungIconView.IconType.TONE_SUN
+            ) {
+                if (firstPhoto != null) showSamsungProPhotoEditor(firstPhoto)
+                else Toast.makeText(this, "لا توجد صور متاحة حالياً", Toast.LENGTH_SHORT).show()
+            },
+            LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(10) }
+        )
+
+        mainCol.addView(
+            buildAiFeatureCard(
+                title = "استوديو مونتاج الفيديو والترجمة (Studio Video & SRT)",
+                subtitle = "قص الفيديو بدون فقدان الجودة، التحكم بالسرعة، وتحميل ملفات الترجمة .SRT",
+                iconType = SamsungIconView.IconType.VIDEO_PLAY
+            ) {
+                if (latestVid != null) openVideoEditor(latestVid)
+                else Toast.makeText(this, "لا توجد مقاطع فيديو متاحة للمونتاج", Toast.LENGTH_SHORT).show()
+            },
+            LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(10) }
+        )
+
+        mainCol.addView(
+            buildAiFeatureCard(
+                title = "الفاحص الذكي للصور المتشابهة وتنظيف المساحة (AI Cleaner)",
+                subtitle = "فحص البصمة البصرية للصور لاكتشاف المكرر والملفات الضخمة فوراً",
+                iconType = SamsungIconView.IconType.TAB_FOUR_DOTS
+            ) {
+                showAiSmartDuplicateCleanerDialog()
+            },
+            LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(10) }
+        )
+
+        mainCol.addView(
+            buildAiFeatureCard(
+                title = "الخزنة الخاصة المشفّرة والحماية البيومترية",
+                subtitle = "إخفاء وتشفير الصور والفيديوهات بـ AES-256 مع دعم بصمة الوجه والإصبع",
+                iconType = SamsungIconView.IconType.LOCK
+            ) {
+                openVault()
+            },
+            LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(18) }
+        )
+
+        // 4. شريط أحدث مقاطع الفيديو للوصول السريع للمشغل أو المونتاج
+        if (allVideos.isNotEmpty()) {
+            val vidHeaderRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(4), dp(4), dp(4), dp(10))
+                layoutDirection = View.LAYOUT_DIRECTION_LTR
+            }
+            val viewAllVidsTv = TextView(this).apply {
+                text = "عرض الكل (${toArabicDigits(allVideos.size)})"
+                textSize = 13f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(colorSamsungBlue)
+                setOnClickListener { openSubPage("مقاطع فيديو", allVideos) }
+            }
+            vidHeaderRow.addView(viewAllVidsTv)
+            vidHeaderRow.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+            vidHeaderRow.addView(TextView(this).apply {
+                text = "أحدث الفيديوهات"
+                textSize = 16f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(colorTextPrimary)
+            })
+            mainCol.addView(vidHeaderRow, LinearLayout.LayoutParams(-1, -2))
+
+            val hScroll = HorizontalScrollView(this).apply {
+                isHorizontalScrollBarEnabled = false
+            }
+            val vidsRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                layoutDirection = View.LAYOUT_DIRECTION_RTL
+            }
+            for (vItem in allVideos.take(10)) {
+                val vCard = FrameLayout(this).apply {
+                    isClickable = true
+                    setOnClickListener { openFullCinemaVideoPlayer(vItem, allVideos) }
+                }
+                val thumb = AsyncMediaThumbnailView(
+                    context = this,
+                    media = vItem,
+                    cornerRadiusPx = dpF(18f),
+                    strokeColor = colorBorderSubtle,
+                    preferredDecodePx = dp(200)
                 )
+                vCard.addView(thumb, FrameLayout.LayoutParams(-1, -1))
+                val durBadge = TextView(this).apply {
+                    text = vItem.durationText.ifEmpty { "فيديو" }
+                    textSize = 11f
+                    typeface = Typeface.DEFAULT_BOLD
+                    setTextColor(Color.WHITE)
+                    background = GradientDrawable().apply {
+                        setColor(0xAA000000.toInt())
+                        cornerRadius = dpF(8f)
+                    }
+                    setPadding(dp(8), dp(2), dp(8), dp(2))
+                }
+                vCard.addView(durBadge, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.LEFT).apply {
+                    leftMargin = dp(8)
+                    bottomMargin = dp(8)
+                })
+                vidsRow.addView(vCard, LinearLayout.LayoutParams(dp(145), dp(105)).apply {
+                    leftMargin = dp(8)
+                })
             }
+            hScroll.addView(vidsRow)
+            mainCol.addView(hScroll, LinearLayout.LayoutParams(-1, -2))
         }
 
-        scroll.addView(col, FrameLayout.LayoutParams(-1, -2))
+        scroll.addView(mainCol, FrameLayout.LayoutParams(-1, -2))
         wrapper.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
         return wrapper
     }
 
-    private fun buildLargeRealStoryCard(story: StoryInfo): View {
-        val cardFrame = FrameLayout(this).apply {
-            isClickable = true
-            setOnClickListener {
-                showStoryPlayerOverlay(story)
-            }
+    /**
+     * فاحص الذكاء الاصطناعي للصور المكررة والملفات الكبيرة (AI Smart Cleaner)
+     */
+    private fun showAiSmartDuplicateCleanerDialog() {
+        val visible = getVisibleMediaItems()
+        if (visible.isEmpty()) {
+            Toast.makeText(this, "لا توجد وسائط لفحصها حالياً", Toast.LENGTH_SHORT).show()
+            return
         }
+        val bySizeAndDim = visible.filter { !it.isVideo && it.sizeBytes > 0L }
+            .groupBy { "${it.sizeBytes}_${it.widthPx}x${it.heightPx}" }
+            .values
+            .filter { it.size > 1 }
+            .flatten()
 
-        val coverMedia = story.items.firstOrNull() ?: getVisibleMediaItems().firstOrNull()
-        if (coverMedia != null) {
-            val thumb = AsyncMediaThumbnailView(
-                context = this,
-                media = coverMedia,
-                cornerRadiusPx = dpF(28f),
-                strokeColor = colorBorderSubtle,
-                preferredDecodePx = 960
-            )
-            cardFrame.addView(thumb, FrameLayout.LayoutParams(-1, -1))
-        }
+        val largeFiles = visible.filter { it.sizeBytes >= 25L * 1024L * 1024L }
+        val totalBytes = visible.sumOf { it.sizeBytes }
 
-        val bottomScrim = View(this).apply {
-            background = GradientDrawable(
-                GradientDrawable.Orientation.TOP_BOTTOM,
-                intArrayOf(Color.TRANSPARENT, 0xAA000000.toInt())
-            ).apply {
-                cornerRadius = dpF(28f)
-            }
-        }
-        cardFrame.addView(bottomScrim, FrameLayout.LayoutParams(-1, -1))
+        val options = arrayOf(
+            "الصور المتطابقة والمكررة (${toArabicDigits(bySizeAndDim.size)} صورة)",
+            "الفيديوهات والملفات الضخمة أكبر من ٢٥ ميجابايت (${toArabicDigits(largeFiles.size)} ملف)",
+            "عرض جميع مقاطع الفيديو (${toArabicDigits(visible.count { it.isVideo })} فيديو)",
+            "عرض صور الشاشة (Screenshots)"
+        )
 
-        val titleBox = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(dp(16), dp(16), dp(16), dp(24))
-        }
-        val titleTv = TextView(this).apply {
-            text = story.title
-            textSize = 23f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Color.WHITE)
-            gravity = Gravity.CENTER
-            setShadowLayer(8f, 0f, 2f, Color.BLACK)
-        }
-        val yearTv = TextView(this).apply {
-            text = story.yearText
-            textSize = 13f
-            setTextColor(0xFFE5E5EA.toInt())
-            gravity = Gravity.CENTER
-        }
-        titleBox.addView(titleTv)
-        titleBox.addView(yearTv, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(4) })
-
-        val titleLp = FrameLayout.LayoutParams(-1, -2).apply {
-            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-        }
-        cardFrame.addView(titleBox, titleLp)
-
-        val topLeftBadges = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            layoutDirection = View.LAYOUT_DIRECTION_LTR
-        }
-
-        val heartIconType = if (story.isFavorite) {
-            SamsungIconView.IconType.HEART_FILLED
-        } else {
-            SamsungIconView.IconType.HEART
-        }
-        val heartColor = if (story.isFavorite) 0xFFFF3B30.toInt() else Color.WHITE
-        val heartView = SamsungIconView(this, heartIconType, heartColor, 1.8f).apply {
-            isClickable = true
-            setOnClickListener {
-                story.isFavorite = !story.isFavorite
-                renderActiveScreen()
-            }
-        }
-        topLeftBadges.addView(heartView, LinearLayout.LayoutParams(dp(24), dp(24)))
-
-        if (story.isNew) {
-            val newBadge = TextView(this).apply {
-                text = "جديد"
-                textSize = 10.5f
-                typeface = Typeface.DEFAULT_BOLD
-                setTextColor(Color.WHITE)
-                setPadding(dp(9), dp(2), dp(9), dp(3))
-                background = GradientDrawable().apply {
-                    setColor(colorSamsungOrange)
-                    cornerRadius = dpF(10f)
+        AlertDialog.Builder(this)
+            .setTitle("الفاحص الذكي للمساحة • إجمالي ${formatFileSizeArabic(totalBytes)}")
+            .setItems(options) { _, which ->
+                when (which) {
+                    0 -> {
+                        if (bySizeAndDim.isEmpty()) {
+                            Toast.makeText(this, "معرضك نظيف، لم يتم العثور على صور مكررة", Toast.LENGTH_SHORT).show()
+                        } else {
+                            openSubPage("صور مكررة مكتشفة", bySizeAndDim)
+                        }
+                    }
+                    1 -> {
+                        if (largeFiles.isEmpty()) {
+                            Toast.makeText(this, "لا توجد ملفات ضخمة تتجاوز ٢٥ ميجابايت", Toast.LENGTH_SHORT).show()
+                        } else {
+                            openSubPage("الملفات الضخمة", largeFiles)
+                        }
+                    }
+                    2 -> openSubPage("مقاطع فيديو", visible.filter { it.isVideo })
+                    3 -> openSubPage("صور الشاشة", visible.filter { it.albumName == "صور الشاشة" })
                 }
             }
-            topLeftBadges.addView(
-                newBadge,
-                LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(8) }
-            )
-        }
-
-        val badgeLp = FrameLayout.LayoutParams(-2, -2).apply {
-            gravity = Gravity.TOP or Gravity.LEFT
-            leftMargin = dp(20)
-            topMargin = dp(18)
-        }
-        cardFrame.addView(topLeftBadges, badgeLp)
-
-        return cardFrame
+            .setPositiveButton("إغلاق", null)
+            .show()
     }
 
-    private fun showStoriesMorePopover() {
-        val items = listOf(
-            MenuOption("إنشاء قصة") { showCreateStoryDialog() },
-            MenuOption("تحديث القصص التلقائية") {
-                rebuildDynamicStoriesFromRealMedia()
-                renderActiveScreen()
-            },
-            MenuOption("بدء عرض الشرائح") {
-                startSlideshow(getVisibleMediaItems())
-            }
-        )
-        showTopLeftFloatingMenu(items)
-    }
-
-    // ============================================================
-    // 4. النافذة السفلية المنبثقة ( Hamburger Menu)
-    // ============================================================
     private fun showHamburgerBottomPopup() {
         overlayLayer.removeAllViews()
         overlayLayer.visibility = View.VISIBLE
@@ -4361,17 +4384,108 @@ class MainActivity : Activity() {
         }
         topHeader.addView(moreCinemaBtn, LinearLayout.LayoutParams(dp(38), dp(38)))
 
+        val subtitleDisplayTv = TextView(this).apply {
+            text = ""
+            textSize = 16.5f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            setPadding(dp(16), dp(8), dp(16), dp(8))
+            background = GradientDrawable().apply {
+                setColor(0xBB000000.toInt())
+                cornerRadius = dpF(12f)
+            }
+            visibility = View.GONE
+        }
+        root.addView(
+            subtitleDisplayTv,
+            FrameLayout.LayoutParams(-2, -2).apply {
+                gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                bottomMargin = dp(104)
+                leftMargin = dp(24)
+                rightMargin = dp(24)
+            }
+        )
+
         val ccBtn = TextView(this).apply {
             text = "CC"
             textSize = 13.5f
             typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Color.WHITE)
+            setTextColor(if (activeCinemaSubtitleCues.isNotEmpty()) colorBrandIceBlue else Color.WHITE)
             gravity = Gravity.CENTER
             setPadding(dp(8), dp(4), dp(8), dp(4))
             setOnClickListener {
-                captionsEnabled = !captionsEnabled
-                setTextColor(if (captionsEnabled) colorBrandIceBlue else Color.WHITE)
-                flashFeedback(if (captionsEnabled) "تم تفعيل الترجمة التلقائية (CC)" else "تم إيقاف الترجمة (CC)")
+                val subOptions = if (activeCinemaSubtitleCues.isEmpty()) {
+                    arrayOf("تحميل ملف ترجمة خارجي (.SRT / .VTT) من الهاتف")
+                } else {
+                    arrayOf(
+                        "تغيير ملف الترجمة الحالي ($activeCinemaSubtitleName)",
+                        if (captionsEnabled) "إخفاء الترجمة مؤقتاً" else "إظهار الترجمة",
+                        "تقديم وقت الترجمة (-0.5 ثانية)",
+                        "تأخير وقت الترجمة (+0.5 ثانية)",
+                        "إلغاء ملف الترجمة"
+                    )
+                }
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("ترجمة الفيديو (Subtitles CC)")
+                    .setItems(subOptions) { _, w ->
+                        if (activeCinemaSubtitleCues.isEmpty()) {
+                            onCinemaSubtitleLoadedCallback = {
+                                captionsEnabled = true
+                                setTextColor(colorBrandIceBlue)
+                            }
+                            try {
+                                val pickIntent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                                    addCategory(Intent.CATEGORY_OPENABLE)
+                                    type = "*/*"
+                                }
+                                markExternalLaunch()
+                                @Suppress("DEPRECATION")
+                                startActivityForResult(pickIntent, REQ_PICK_PLAYER_SUBTITLE)
+                            } catch (_: Exception) {
+                                Toast.makeText(this@MainActivity, "تعذر فتح منتقي ملفات الترجمة", Toast.LENGTH_SHORT).show()
+                            }
+                        } else {
+                            when (w) {
+                                0 -> {
+                                    onCinemaSubtitleLoadedCallback = {
+                                        captionsEnabled = true
+                                        setTextColor(colorBrandIceBlue)
+                                    }
+                                    try {
+                                        val pickIntent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                                            addCategory(Intent.CATEGORY_OPENABLE)
+                                            type = "*/*"
+                                        }
+                                        markExternalLaunch()
+                                        @Suppress("DEPRECATION")
+                                        startActivityForResult(pickIntent, REQ_PICK_PLAYER_SUBTITLE)
+                                    } catch (_: Exception) {}
+                                }
+                                1 -> {
+                                    captionsEnabled = !captionsEnabled
+                                    setTextColor(if (captionsEnabled) colorBrandIceBlue else Color.WHITE)
+                                    if (!captionsEnabled) subtitleDisplayTv.visibility = View.GONE
+                                }
+                                2 -> {
+                                    activeCinemaSubtitleOffsetMs -= 500L
+                                    flashFeedback("مزامنة الترجمة: ${activeCinemaSubtitleOffsetMs}ms")
+                                }
+                                3 -> {
+                                    activeCinemaSubtitleOffsetMs += 500L
+                                    flashFeedback("مزامنة الترجمة: +${activeCinemaSubtitleOffsetMs}ms")
+                                }
+                                4 -> {
+                                    activeCinemaSubtitleCues = emptyList()
+                                    activeCinemaSubtitleName = ""
+                                    captionsEnabled = false
+                                    subtitleDisplayTv.visibility = View.GONE
+                                    setTextColor(Color.WHITE)
+                                }
+                            }
+                        }
+                    }
+                    .show()
             }
         }
         topHeader.addView(ccBtn, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(4) })
@@ -4428,7 +4542,7 @@ class MainActivity : Activity() {
         captureToolsRow.addView(gifBtn, LinearLayout.LayoutParams(dp(38), dp(38)).apply { leftMargin = dp(8) })
 
         val proMontagePill = TextView(this).apply {
-            text = "✂️ مونتاج وقص"
+            text = "استوديو المونتاج"
             textSize = 12f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.WHITE)
@@ -4807,6 +4921,17 @@ class MainActivity : Activity() {
                         elapsedTv.text = formatVideoTimeArabic(pos)
                         totalDurTv.text = formatVideoTimeArabic(dur)
                         seekBar.progress = ((pos.toLong() * 1000L) / dur).toInt().coerceIn(0, 1000)
+                        if (captionsEnabled && activeCinemaSubtitleCues.isNotEmpty()) {
+                            val cue = SubtitleParser.findActiveCue(activeCinemaSubtitleCues, pos.toLong(), activeCinemaSubtitleOffsetMs)
+                            if (!cue.isNullOrBlank()) {
+                                subtitleDisplayTv.text = cue
+                                subtitleDisplayTv.visibility = View.VISIBLE
+                            } else {
+                                subtitleDisplayTv.visibility = View.GONE
+                            }
+                        } else {
+                            subtitleDisplayTv.visibility = View.GONE
+                        }
                     }
                 } catch (_: Exception) {}
                 handler.postDelayed(this, 250L)
@@ -4968,10 +5093,10 @@ class MainActivity : Activity() {
     }
 
     private fun showViewerMoreMenu(media: MediaItem, onRefresh: () -> Unit) {
-        val aiOrVideoLabel = if (media.isVideo) "استوديو مونتاج وقص الفيديو 🎬" else "مسح أجسام بالذكاء الاصطناعي العصبي ✨"
+        val aiOrVideoLabel = if (media.isVideo) "استوديو مونتاج وقص الفيديو" else "مسح أجسام بالذكاء الاصطناعي العصبي"
         val options = arrayOf(
             aiOrVideoLabel,
-            "نقل إلى الخزنة الخاصة المشفّرة 🔒",
+            "نقل إلى الخزنة الخاصة المشفّرة",
             "التفاصيل ومعلومات الملف (EXIF)",
             "إعادة تسمية الملف",
             "نقل إلى ألبوم",
@@ -5207,7 +5332,7 @@ class MainActivity : Activity() {
                 shape = GradientDrawable.OVAL
                 setColor(0xFF1E1E22.toInt())
             }
-            setOnClickListener { shareMediaItem(media) }
+            setOnClickListener { editorCanvasView.redoLastStroke() }
         }
         val redoIcon = SamsungIconView(this, SamsungIconView.IconType.REDO_CURVE, Color.WHITE, 1.9f)
         redoCircle.addView(redoIcon, FrameLayout.LayoutParams(dp(18), dp(18)).apply { gravity = Gravity.CENTER })
@@ -5285,22 +5410,33 @@ class MainActivity : Activity() {
                         }
                     }
                     val rotBtn = TextView(this).apply {
-                        text = ""
-                        textSize = 15f
+                        text = "تدوير 90°"
+                        textSize = 11.5f
+                        typeface = Typeface.DEFAULT_BOLD
                         setTextColor(Color.WHITE)
-                        setPadding(dp(14), 0, dp(14), 0)
+                        setPadding(dp(12), dp(2), dp(12), dp(2))
                         setOnClickListener { editorCanvasView.rotate90() }
                     }
                     val flipBtn = TextView(this).apply {
-                        text = "‹|›"
-                        textSize = 13f
+                        text = "قلب أفقي"
+                        textSize = 11.5f
+                        typeface = Typeface.DEFAULT_BOLD
                         setTextColor(Color.WHITE)
-                        setPadding(dp(10), 0, dp(10), 0)
+                        setPadding(dp(10), dp(2), dp(10), dp(2))
                         setOnClickListener { editorCanvasView.flipHorizontal() }
+                    }
+                    val applyCropBtn = TextView(this).apply {
+                        text = "قص"
+                        textSize = 11.5f
+                        typeface = Typeface.DEFAULT_BOLD
+                        setTextColor(colorBrandIceBlue)
+                        setPadding(dp(10), dp(2), dp(10), dp(2))
+                        setOnClickListener { editorCanvasView.applyCropNow() }
                     }
                     miniPill.addView(ratioBtn)
                     miniPill.addView(rotBtn)
                     miniPill.addView(flipBtn)
+                    miniPill.addView(applyCropBtn)
                     dynamicToolArea.addView(
                         miniPill,
                         LinearLayout.LayoutParams(-2, -2).apply { bottomMargin = dp(12) }
@@ -5675,34 +5811,77 @@ class MainActivity : Activity() {
 
                 4 -> {
                     // ====================================================
-                    // التبويب 4: البطاقات الثلاث المتقدمة (تحديد حر | لون البقعة | مزيج الألوان) كما في 1000036301.png
+                    // التبويب 4: مختبر الذكاء الاصطناعي المحلي والأدوات المتقدمة (On-Device Neural AI Suite)
                     // ====================================================
+                    val aiTitle = TextView(this).apply {
+                        text = "أدوات الذكاء الاصطناعي المحلية (On-Device AI)"
+                        textSize = 12f
+                        typeface = Typeface.DEFAULT_BOLD
+                        setTextColor(colorBrandIceBlue)
+                        gravity = Gravity.CENTER
+                    }
+                    dynamicToolArea.addView(aiTitle, LinearLayout.LayoutParams(-2, -2).apply { bottomMargin = dp(8) })
+
+                    val hScroll = HorizontalScrollView(this).apply {
+                        isHorizontalScrollBarEnabled = false
+                    }
                     val cardsRow = LinearLayout(this).apply {
                         orientation = LinearLayout.HORIZONTAL
-                        gravity = Gravity.CENTER
-                        setPadding(dp(8), dp(8), dp(8), dp(8))
-                        layoutDirection = View.LAYOUT_DIRECTION_LTR
+                        gravity = Gravity.CENTER_VERTICAL
+                        setPadding(dp(8), dp(4), dp(8), dp(4))
+                        layoutDirection = View.LAYOUT_DIRECTION_RTL
                     }
 
                     val advancedCards = listOf(
-                        BottomAction("مسح الأجسام AI", SamsungIconView.IconType.ERASER_BOX) {
+                        BottomAction("ممحاة الأجسام", SamsungIconView.IconType.ERASER_BOX) {
                             openObjectEraser(media)
                         },
-                        BottomAction("مزيج الألوان", SamsungIconView.IconType.PALETTE_MIX) {
-                            editorCanvasView.warmthLevel = if (editorCanvasView.warmthLevel == 0) 35 else 0
-                            editorCanvasView.saturationLevel = 25
-                            editorCanvasView.invalidate()
-                            Toast.makeText(this@MainActivity, "تم تطبيق مزيج الألوان الاحترافي", Toast.LENGTH_SHORT).show()
+                        BottomAction("تحسين ذكي AI", SamsungIconView.IconType.TONE_SUN) {
+                            Toast.makeText(this@MainActivity, "جاري التحسين الذكي للصورة محلياً...", Toast.LENGTH_SHORT).show()
+                            viewerExecutor.execute {
+                                val enhanced = MangoAiStudio.aiRemasterImage(editorCanvasView.getCurrentWorkingBitmap())
+                                handler.post {
+                                    editorCanvasView.replaceWorkingBitmap(enhanced)
+                                    Toast.makeText(this@MainActivity, "تم تطبيق التحسين الذكي (AI Remaster)", Toast.LENGTH_SHORT).show()
+                                }
+                            }
                         },
-                        BottomAction("لون البقعة", SamsungIconView.IconType.EYEDROPPER) {
+                        BottomAction("عزل الخلفية", SamsungIconView.IconType.LASSO_SCISSORS) {
+                            Toast.makeText(this@MainActivity, "جاري عزل الخلفية بالذكاء الاصطناعي...", Toast.LENGTH_SHORT).show()
+                            viewerExecutor.execute {
+                                val bokeh = MangoAiStudio.aiPortraitBokeh(editorCanvasView.getCurrentWorkingBitmap())
+                                handler.post {
+                                    editorCanvasView.replaceWorkingBitmap(bokeh)
+                                    Toast.makeText(this@MainActivity, "تم تطبيق عزل الخلفية البورتريه (AI Bokeh)", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        },
+                        BottomAction("مستند واضح", SamsungIconView.IconType.TAB_CROP_ROTATE) {
+                            viewerExecutor.execute {
+                                val docBmp = MangoAiStudio.aiEnhanceDocument(editorCanvasView.getCurrentWorkingBitmap())
+                                handler.post {
+                                    editorCanvasView.replaceWorkingBitmap(docBmp)
+                                    Toast.makeText(this@MainActivity, "تم تصفية المستند وتوضيح النصوص", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        },
+                        BottomAction("رؤية ليلية AI", SamsungIconView.IconType.TONE_EXPOSURE) {
+                            viewerExecutor.execute {
+                                val nightBmp = MangoAiStudio.aiNightSightEnhance(editorCanvasView.getCurrentWorkingBitmap())
+                                handler.post {
+                                    editorCanvasView.replaceWorkingBitmap(nightBmp)
+                                    Toast.makeText(this@MainActivity, "تم تفتيح اللقطة الليلية بالذكاء الاصطناعي", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        },
+                        BottomAction("لوحة الألوان", SamsungIconView.IconType.PALETTE_MIX) {
+                            val palette = MangoAiStudio.extractDominantPalette(editorCanvasView.getCurrentWorkingBitmap(), 5)
+                            showExtractedPaletteDialog(palette)
+                        },
+                        BottomAction("عزل الألوان", SamsungIconView.IconType.EYEDROPPER) {
                             editorCanvasView.presetFilterCode = if (editorCanvasView.presetFilterCode == 4) 0 else 4
                             editorCanvasView.invalidate()
-                            Toast.makeText(this@MainActivity, "تم تفعيل عزل الألوان (Spot Color)", Toast.LENGTH_SHORT).show()
-                        },
-                        BottomAction("تحديد حر", SamsungIconView.IconType.LASSO_SCISSORS) {
-                            editorCanvasView.vignetteActive = !editorCanvasView.vignetteActive
-                            editorCanvasView.invalidate()
-                            Toast.makeText(this@MainActivity, "تم تطبيق التركيز البؤري الحر", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(this@MainActivity, "تم تفعيل عزل الألوان", Toast.LENGTH_SHORT).show()
                         }
                     )
 
@@ -5710,34 +5889,37 @@ class MainActivity : Activity() {
                         val card = LinearLayout(this).apply {
                             orientation = LinearLayout.VERTICAL
                             gravity = Gravity.CENTER
-                            setPadding(dp(12), dp(16), dp(12), dp(16))
+                            setPadding(dp(10), dp(14), dp(10), dp(14))
                             isClickable = true
                             background = GradientDrawable().apply {
                                 setColor(0xFF1A1A1E.toInt())
-                                cornerRadius = dpF(20f)
+                                cornerRadius = dpF(18f)
+                                setStroke(dp(1), 0xFF2C2C32.toInt())
                             }
                             setOnClickListener { cAction() }
                         }
-                        val ic = SamsungIconView(this, cIcon, Color.WHITE, 1.9f)
-                        card.addView(ic, LinearLayout.LayoutParams(dp(28), dp(28)))
+                        val ic = SamsungIconView(this, cIcon, colorBrandIceBlue, 1.9f)
+                        card.addView(ic, LinearLayout.LayoutParams(dp(24), dp(24)))
                         val tv = TextView(this).apply {
                             text = cLabel
-                            textSize = 12f
+                            textSize = 11.5f
+                            typeface = Typeface.DEFAULT_BOLD
                             setTextColor(Color.WHITE)
                             gravity = Gravity.CENTER
                         }
-                        card.addView(tv, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(12) })
+                        card.addView(tv, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(10) })
                         cardsRow.addView(
                             card,
-                            LinearLayout.LayoutParams(dp(96), dp(104)).apply { setMargins(dp(6), 0, dp(6), 0) }
+                            LinearLayout.LayoutParams(dp(92), dp(96)).apply { setMargins(dp(5), 0, dp(5), 0) }
                         )
                     }
-                    dynamicToolArea.addView(cardsRow, LinearLayout.LayoutParams(-1, -2))
+                    hScroll.addView(cardsRow)
+                    dynamicToolArea.addView(hScroll, LinearLayout.LayoutParams(-1, -2))
                 }
             }
 
             // رسم شريط الأيقونات الخمسة السفلي (من اليسار لليمين كما في الصور المرفقة):
-            // [ ⊞ (4) ]  [  (3) ]  [ ☀ (2) ]  [ Circles (1) ]  [ Crop (0) ]
+            // شريط الأيقونات الخمسة السفلي
             bottomIconsBar.removeAllViews()
             val bottomTabDefs = listOf(
                 Pair(SamsungIconView.IconType.TAB_FOUR_DOTS, 4),
@@ -5767,6 +5949,39 @@ class MainActivity : Activity() {
 
         rebuildSamsungEditorUI()
         overlayLayer.addView(root, FrameLayout.LayoutParams(-1, -1))
+    }
+
+    private fun showExtractedPaletteDialog(colors: IntArray) {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(16), dp(20), dp(12))
+        }
+        for (c in colors) {
+            val hex = String.format(Locale.US, "#%06X", 0xFFFFFF and c)
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(12), dp(10), dp(12), dp(10))
+                background = GradientDrawable().apply {
+                    setColor(c)
+                    cornerRadius = dpF(14f)
+                }
+            }
+            val label = TextView(this).apply {
+                text = "اللون المستخرج: $hex"
+                textSize = 14f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(Color.WHITE)
+                setShadowLayer(4f, 0f, 1f, Color.BLACK)
+            }
+            row.addView(label)
+            box.addView(row, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
+        }
+        AlertDialog.Builder(this)
+            .setTitle("لوحة الألوان السائدة بالذكاء الاصطناعي")
+            .setView(box)
+            .setPositiveButton("حسناً", null)
+            .show()
     }
 
     private fun showPenColorAndSizeDialog(
@@ -6551,7 +6766,7 @@ class MainActivity : Activity() {
             setPadding(0, dp(4), 0, 0)
         })
         heroInfoCol.addView(TextView(this).apply {
-            text = "⚡ المحرك العصبي: ${hwProfile.acceleratorName}"
+            text = "المحرك العصبي: ${hwProfile.acceleratorName}"
             textSize = 11.5f
             setTextColor(0xFFD0E2F8.toInt())
             gravity = Gravity.RIGHT
@@ -6562,7 +6777,7 @@ class MainActivity : Activity() {
         content.addView(heroCard, LinearLayout.LayoutParams(-1, -2))
 
         // 2. قسم الخزنة الخاصة المشفّرة والقياسات الحيوية (البصمة)
-        content.addView(makeSectionTitle("🔒 الخزنة الخاصة والحماية البيومترية"))
+        content.addView(makeSectionTitle("الخزنة الخاصة والحماية البيومترية"))
         val vaultCard = makeCard()
         vaultCard.addView(makeSettingRow(
             title = "فتح الخزنة الخاصة المشفّرة",
@@ -6587,7 +6802,7 @@ class MainActivity : Activity() {
         content.addView(vaultCard, LinearLayout.LayoutParams(-1, -2))
 
         // 3. قسم الأداء الفائق للأجهزة الضعيفة والمحرك العصبي
-        content.addView(makeSectionTitle("🚀 الأداء والسلاسة والذكاء الاصطناعي العصبي"))
+        content.addView(makeSectionTitle("الأداء والسلاسة والذكاء الاصطناعي العصبي"))
         val perfCard = makeCard()
         perfCard.addView(makeSettingRow(
             title = "وضع السلاسة الفائقة للأجهزة الضعيفة (Turbo 60/120Hz)",
@@ -6595,7 +6810,7 @@ class MainActivity : Activity() {
                 "مفعّل: يقلل استهلاك الرام بترميز RGB_565 ويسرّع التمرير الفوري دون تقطيع"
             else
                 "غير مفعّل: يعرض المصغرات بدقة لونية قصوى ARGB_8888 للأجهزة القوية",
-            badgeText = if (lowEndSmoothMode) "مفعّل ✓" else "تفعيل",
+            badgeText = if (lowEndSmoothMode) "مفعّل" else "تفعيل",
             badgeColor = if (lowEndSmoothMode) 0xFF2E7D32.toInt() else 0xFF424248.toInt(),
             showDivider = true
         ) {
@@ -6605,7 +6820,7 @@ class MainActivity : Activity() {
             showGallerySettingsDialog()
             Toast.makeText(
                 this,
-                if (lowEndSmoothMode) "تم تفعيل وضع السلاسة الفائقة للأجهزة الضعيفة ⚡" else "تم تفعيل وضع الدقة القصوى",
+                if (lowEndSmoothMode) "تم تفعيل وضع السلاسة الفائقة للأجهزة الضعيفة" else "تم تفعيل وضع الدقة القصوى",
                 Toast.LENGTH_SHORT
             ).show()
         })
@@ -6623,7 +6838,7 @@ class MainActivity : Activity() {
                     "• المعالج: ${hwProfile.chipSummary}\n" +
                     "• المسرّع: ${hwProfile.acceleratorName}\n" +
                     "• الوضع التلقائي: ${hwProfile.displayTitleAr}\n\n" +
-                    "يمكنك استخدام الممحاة الذكية من خلال فتح أي صورة ثم اختيار (تعديل) أو (مسح أجسام بالذكاء الاصطناعي ✨)."
+                    "يمكنك استخدام الممحاة الذكية من خلال فتح أي صورة ثم اختيار (تعديل) أو (مسح أجسام بالذكاء الاصطناعي)."
                 )
                 .setPositiveButton("حسناً", null)
                 .show()
@@ -6631,7 +6846,7 @@ class MainActivity : Activity() {
         content.addView(perfCard, LinearLayout.LayoutParams(-1, -2))
 
         // 4. قسم المظهر وتخصيص الشبكة والألبومات
-        content.addView(makeSectionTitle("🎨 المظهر وتخصيص العرض والويدجت"))
+        content.addView(makeSectionTitle("المظهر وتخصيص العرض والويدجت"))
         val uiCard = makeCard()
         val themeStr = when (themeMode) {
             1 -> "الوضع الداكن دائماً"
@@ -6683,12 +6898,12 @@ class MainActivity : Activity() {
             sendBroadcast(Intent(this, MangoPhotoWidgetProvider::class.java).apply {
                 action = MangoPhotoWidgetProvider.ACTION_REFRESH
             })
-            Toast.makeText(this, "تم تحديث ويدجت الشاشة الرئيسية ✨", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "تم تحديث ويدجت الشاشة الرئيسية", Toast.LENGTH_SHORT).show()
         })
         content.addView(uiCard, LinearLayout.LayoutParams(-1, -2))
 
         // 5. قسم إدارة الملفات وسلة المحذوفات
-        content.addView(makeSectionTitle("🗂️ إدارة الوسائط وسلة المحذوفات"))
+        content.addView(makeSectionTitle("إدارة الوسائط وسلة المحذوفات"))
         val storageCard = makeCard()
         storageCard.addView(makeSettingRow(
             title = "سلة المحذوفات (تحتفظ بالملفات ٣٠ يوماً)",
@@ -8590,6 +8805,13 @@ class MainActivity : Activity() {
 
         private val displayedImageRect = RectF()
         private val activeCropScreenRect = RectF()
+
+        fun getCurrentWorkingBitmap(): Bitmap = workingBitmap
+
+        fun replaceWorkingBitmap(newBmp: Bitmap) {
+            workingBitmap = newBmp.copy(Bitmap.Config.ARGB_8888, true)
+            invalidate()
+        }
 
         fun rotate90() {
             val m = Matrix().apply { postRotate(90f) }

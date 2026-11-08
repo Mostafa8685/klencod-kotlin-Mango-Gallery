@@ -26,7 +26,7 @@ import java.util.Locale
 import java.util.Random
 
 /**
- * ودجت الذكريات واللحظات المميزة (بستايل ويدجت الطقس والتطبيقات الكبرى):
+ * ودجت الذكريات واللحظات المميزة (بستايل التطبيقات الكبرى بهوية Mango Gallery بدون إيموجي):
  * يعرض التاريخ العربي الحي + شارة حالة الذكرى + إحصائيات المعرض + صورة متجددة بحواف دائرية أنيقة + زر تحديث فوري.
  */
 class MangoPhotoWidgetProvider : AppWidgetProvider() {
@@ -166,7 +166,7 @@ class MangoPhotoWidgetProvider : AppWidgetProvider() {
             } catch (_: Throwable) {
                 "اليوم"
             }
-            views.setTextViewText(R.id.widget_date_badge, "☀️ $dateStr")
+            views.setTextViewText(R.id.widget_date_badge, dateStr)
 
             if (!hasMediaPermission(ctx)) {
                 views.setImageViewBitmap(R.id.widget_image, null)
@@ -179,14 +179,14 @@ class MangoPhotoWidgetProvider : AppWidgetProvider() {
             val bmp = if (pick != null) loadThumb(ctx, pick.uri, 520) else null
             if (pick == null || bmp == null) {
                 views.setImageViewBitmap(R.id.widget_image, null)
-                views.setTextViewText(R.id.widget_caption, "Mango Gallery ✨")
+                views.setTextViewText(R.id.widget_caption, "Mango Gallery")
                 views.setTextViewText(R.id.widget_subcaption, "التقط صوراً جديدة لتظهر ذكرياتك هنا")
             } else {
                 val r = 22f * ctx.resources.displayMetrics.density * (bmp.width / 360f)
                 views.setImageViewBitmap(R.id.widget_image, rounded(bmp, r))
                 views.setTextViewText(
                     R.id.widget_caption,
-                    if (pick.memory) "✨ ذكرى مثل هذا اليوم (${pick.year})" else "📸 لقطة مميزة • ${pick.bucketName}"
+                    if (pick.memory) "ذكرى مثل هذا اليوم (${pick.year})" else "لقطة مميزة • ${pick.bucketName}"
                 )
                 views.setTextViewText(
                     R.id.widget_subcaption,
@@ -220,7 +220,7 @@ class MangoPhotoWidgetProvider : AppWidgetProvider() {
 
 /**
  * ودجت مركز التحكم الذكي (Mango Smart Hub Widget):
- * يعرض إحصائيات المعرض الحية + أزرار وصول فوري للكاميرا، المعرض، الخزنة الخاصة المشفّرة، واستوديو الذكاء الاصطناعي.
+ * يعرض إحصائيات المعرض الحية + أزرار وصول فوري للكاميرا، المعرض، والخزنة الخاصة المشفّرة بدون إيموجي.
  */
 class MangoQuickWidgetProvider : AppWidgetProvider() {
 
@@ -268,7 +268,7 @@ class MangoQuickWidgetProvider : AppWidgetProvider() {
             val v = RemoteViews(context.packageName, R.layout.mango_widget_quick)
             v.setTextViewText(
                 R.id.quick_stats_header,
-                "Mango Gallery • $pCount صورة • $vCount فيديو • 🔒 $vaultCount بالخزنة"
+                "Mango Gallery • $pCount صورة • $vCount فيديو • الخزنة: $vaultCount"
             )
             v.setOnClickPendingIntent(R.id.quick_camera, camera)
             v.setOnClickPendingIntent(R.id.quick_gallery, gallery)

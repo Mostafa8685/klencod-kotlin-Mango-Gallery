@@ -14,7 +14,7 @@
         android:gravity="center"
         android:paddingBottom="6dp"
         android:maxLines="1"
-        android:text="Mango Gallery • وصول ذكي سريع"
+        android:text="Mango Gallery • مركز التحكم السريع"
         android:textColor="#FF8CD0FA"
         android:textSize="11sp"
         android:textStyle="bold" />
@@ -34,7 +34,7 @@
             android:layout_weight="1"
             android:background="@drawable/widget_btn_bg"
             android:gravity="center"
-            android:text="📷 الكاميرا"
+            android:text="الكاميرا"
             android:textColor="#FFFFFFFF"
             android:textSize="12.5sp"
             android:textStyle="bold" />
@@ -47,8 +47,8 @@
             android:layout_weight="1.15"
             android:background="@drawable/widget_accent_bg"
             android:gravity="center"
-            android:text="✨ المعرض"
-            android:textColor="#FF000000"
+            android:text="المعرض"
+            android:textColor="#FFFFFFFF"
             android:textSize="13sp"
             android:textStyle="bold" />
 
@@ -60,7 +60,7 @@
             android:layout_weight="1"
             android:background="@drawable/widget_btn_bg"
             android:gravity="center"
-            android:text="🔒 الخزنة"
+            android:text="الخزنة"
             android:textColor="#FFFFFFFF"
             android:textSize="12.5sp"
             android:textStyle="bold" />

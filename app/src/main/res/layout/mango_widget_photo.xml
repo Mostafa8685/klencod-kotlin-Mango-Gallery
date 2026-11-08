@@ -11,7 +11,7 @@
         android:layout_height="match_parent"
         android:scaleType="centerCrop" />
 
-    <!-- شارة التاريخ العلوية على غرار ويدجت الطقس الاحترافي -->
+    <!-- شارة التاريخ العلوية -->
     <TextView
         android:id="@+id/widget_date_badge"
         android:layout_width="wrap_content"
@@ -23,7 +23,7 @@
         android:paddingEnd="10dp"
         android:paddingTop="4dp"
         android:paddingBottom="4dp"
-        android:text="☀️ اليوم"
+        android:text="اليوم"
         android:textColor="#FFFFFFFF"
         android:textSize="11sp"
         android:textStyle="bold" />
@@ -58,7 +58,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:maxLines="1"
-            android:text="Mango Gallery ✨"
+            android:text="Mango Gallery"
             android:textColor="#FFFFFFFF"
             android:textSize="13.5sp"
             android:textStyle="bold" />

@@ -35,16 +35,14 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
-import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 
 /**
- * شاشة المسح الذكي للأجسام بالذكاء الاصطناعي العصبي (Mango Neural AI Object Eraser).
+ * شاشة المسح الذكي للأجسام بالذكاء الاصطناعي العصبي بهوية Mango Gallery (Samsung One UI Edition).
+ * - مصممة بالكامل بأيقونات المتجهات المرسومة بدقة بدون أي إيموجيات.
  * - تعمل محلياً بالكامل على معالج الهاتف (NPU / NNAPI / Multi-Core CPU) بدون إنترنت.
- * - تتكيف تلقائياً مع قوة الهاتف (الأجهزة الضعيفة، المتوسطة، والرائدة).
- * - تدعم وضعين للتحديد: فرشاة المسح الذكية (Smart Brush) + التحديد الحر المغناطيسي (Magic Lasso).
- * - تدعم التراجع والإعادة، وعدسة التكبير الدقيقة (Precision Loupe) أثناء الرسم، ومعاينة قبل/بعد.
+ * - تدعم الفرشاة الذكية، التحديد الحر المغناطيسي (Lasso)، وعدسة التكبير الدقيقة أثناء اللمس.
  */
 class EraserActivity : Activity() {
 
@@ -52,12 +50,11 @@ class EraserActivity : Activity() {
         const val EXTRA_URI = "eraser_uri"
     }
 
+    private val colorPureBlack = 0xFF000000.toInt()
+    private val colorCardDark = 0xFF1C1C1E.toInt()
+    private val colorBorderSubtle = 0xFF2C2C32.toInt()
     private val accent = 0xFF0A78D6.toInt()
     private val accentLight = 0xFF8CD0FA.toInt()
-    private val mangoGold = 0xFFFF9800.toInt()
-    private val bg = 0xFF090B10.toInt()
-    private val card = 0xFF161922.toInt()
-    private val border = 0xFF262B38.toInt()
 
     private val handler = Handler(Looper.getMainLooper())
     private val io = Executors.newSingleThreadExecutor()
@@ -84,17 +81,35 @@ class EraserActivity : Activity() {
 
     private fun pill(t: String, filled: Boolean, primaryColor: Int = accent, onClick: () -> Unit): TextView = TextView(this).apply {
         text = t
-        textSize = 14f
+        textSize = 13.5f
         typeface = Typeface.DEFAULT_BOLD
         gravity = Gravity.CENTER
         setTextColor(Color.WHITE)
-        background = if (filled) round(primaryColor, 16f) else round(card, 16f, border)
+        background = if (filled) round(primaryColor, 18f) else round(colorCardDark, 18f, colorBorderSubtle)
         setPadding(dp(14), dp(11), dp(14), dp(11))
         setOnClickListener { onClick() }
     }
 
+    private fun makeCircleVectorBtn(iconType: MainActivity.SamsungIconView.IconType, onClick: () -> Unit): View {
+        return FrameLayout(this).apply {
+            isClickable = true
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(colorCardDark)
+                setStroke(dp(1), colorBorderSubtle)
+            }
+            addView(
+                MainActivity.SamsungIconView(this@EraserActivity, iconType, Color.WHITE, 1.9f),
+                FrameLayout.LayoutParams(dp(18), dp(18), Gravity.CENTER)
+            )
+            setOnClickListener { onClick() }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.statusBarColor = colorPureBlack
+        window.navigationBarColor = colorPureBlack
         val uri = intent?.getParcelableExtra<Uri>(EXTRA_URI)
         if (uri == null) {
             finish()
@@ -105,42 +120,59 @@ class EraserActivity : Activity() {
         val hwProfile = ObjectEraser.detectHardwareProfile(this)
 
         val root = FrameLayout(this)
-        root.setBackgroundColor(bg)
+        root.setBackgroundColor(colorPureBlack)
 
-        val page = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val page = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
 
-        // الشريط العلوي الاحترافي
+        // الشريط العلوي الاحترافي بدون إيموجي
         val top = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(10), dp(32), dp(10), dp(8))
+            setPadding(dp(12), dp(32), dp(12), dp(10))
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
         }
-        top.addView(iconBtn("✕") { if (!processing) finish() })
+        saveBtn = pill("حفظ", true, accent) { if (!processing) saveResult() }
+        saveBtn.alpha = 0.4f
+        top.addView(saveBtn)
+
+        top.addView(
+            makeCircleVectorBtn(MainActivity.SamsungIconView.IconType.UNDO_CURVE) { if (!processing) canvasView.undoStroke() },
+            LinearLayout.LayoutParams(dp(38), dp(38)).apply { leftMargin = dp(8) }
+        )
+        top.addView(
+            makeCircleVectorBtn(MainActivity.SamsungIconView.IconType.REDO_CURVE) { if (!processing) canvasView.redoStroke() },
+            LinearLayout.LayoutParams(dp(38), dp(38)).apply { leftMargin = dp(6) }
+        )
 
         val titleCol = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(8), 0, dp(8), 0)
+            gravity = Gravity.RIGHT
+            setPadding(dp(10), 0, dp(10), 0)
         }
         titleCol.addView(TextView(this).apply {
-            text = "الممحاة الذكية بالذكاء الاصطناعي ✨"
+            text = "ممحاة العناصر بالذكاء الاصطناعي"
             textSize = 16.5f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.WHITE)
+            gravity = Gravity.RIGHT
         })
         chipBadgeTv = TextView(this).apply {
-            text = "⚡ ${hwProfile.acceleratorName} • ${hwProfile.displayTitleAr}"
+            text = "${hwProfile.acceleratorName} • ${hwProfile.displayTitleAr}"
             textSize = 11f
             setTextColor(accentLight)
+            gravity = Gravity.RIGHT
             setOnClickListener { showHardwareEngineDialog(hwProfile) }
         }
         titleCol.addView(chipBadgeTv)
         top.addView(titleCol, LinearLayout.LayoutParams(0, -2, 1f))
 
-        top.addView(iconBtn("↶") { if (!processing) canvasView.undoStroke() })
-        top.addView(iconBtn("↷") { if (!processing) canvasView.redoStroke() })
-        saveBtn = pill("حفظ", true, mangoGold) { if (!processing) saveResult() }
-        saveBtn.alpha = 0.4f
-        top.addView(saveBtn)
+        top.addView(
+            makeCircleVectorBtn(MainActivity.SamsungIconView.IconType.CHEVRON_RIGHT) { if (!processing) finish() },
+            LinearLayout.LayoutParams(dp(38), dp(38))
+        )
         page.addView(top, LinearLayout.LayoutParams(-1, -2))
 
         // لوحة الرسم والمعاينة
@@ -151,21 +183,22 @@ class EraserActivity : Activity() {
         val bottom = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = GradientDrawable().apply {
-                setColor(card)
+                setColor(colorCardDark)
                 cornerRadii = floatArrayOf(
                     dp(24).toFloat(), dp(24).toFloat(),
                     dp(24).toFloat(), dp(24).toFloat(),
                     0f, 0f, 0f, 0f
                 )
-                setStroke(dp(1), border)
+                setStroke(dp(1), colorBorderSubtle)
             }
             setPadding(dp(16), dp(14), dp(16), dp(18))
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
         }
 
-        // شريط اختيار وضع الأداة (فرشاة ذكية / تحديد حر Lasso / جودة المعالجة)
         val modeRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
         }
         lateinit var brushModeBtn: TextView
         lateinit var lassoModeBtn: TextView
@@ -173,17 +206,17 @@ class EraserActivity : Activity() {
 
         fun refreshModeButtons() {
             val isLasso = canvasView.lassoMode
-            brushModeBtn.background = if (!isLasso) round(accent, 14f) else round(bg, 14f, border)
-            lassoModeBtn.background = if (isLasso) round(accent, 14f) else round(bg, 14f, border)
+            brushModeBtn.background = if (!isLasso) round(accent, 14f) else round(colorPureBlack, 14f, colorBorderSubtle)
+            lassoModeBtn.background = if (isLasso) round(accent, 14f) else round(colorPureBlack, 14f, colorBorderSubtle)
             engineModeBtn.text = when (qualityMode) {
-                1 -> "⚡ سرعة قصوى"
-                2 -> "💎 دقة فائقة"
-                else -> "🧠 تلقائي ذكي"
+                1 -> "سرعة قصوى"
+                2 -> "دقة فائقة"
+                else -> "تلقائي ذكي"
             }
         }
 
         brushModeBtn = TextView(this).apply {
-            text = "🖌️ فرشاة ذكية"
+            text = "فرشاة ذكية"
             textSize = 12.5f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.WHITE)
@@ -195,7 +228,7 @@ class EraserActivity : Activity() {
             }
         }
         lassoModeBtn = TextView(this).apply {
-            text = "⭕ تحديد محيط (Lasso)"
+            text = "تحديد حر (Lasso)"
             textSize = 12.5f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.WHITE)
@@ -211,7 +244,7 @@ class EraserActivity : Activity() {
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(accentLight)
             gravity = Gravity.CENTER
-            background = round(bg, 14f, border)
+            background = round(colorPureBlack, 14f, colorBorderSubtle)
             setPadding(dp(10), dp(8), dp(10), dp(8))
             setOnClickListener {
                 qualityMode = (qualityMode + 1) % 3
@@ -223,15 +256,16 @@ class EraserActivity : Activity() {
         modeRow.addView(brushModeBtn, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(6) })
         modeRow.addView(lassoModeBtn, LinearLayout.LayoutParams(0, -2, 1.15f).apply { rightMargin = dp(6) })
         modeRow.addView(engineModeBtn, LinearLayout.LayoutParams(0, -2, 0.95f))
-        bottom.addView(modeRow, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(10) })
+        bottom.addView(modeRow, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
 
-        // شريط حجم الفرشاة
+        // مسطرة حجم الفرشاة
         val sizeRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
         }
         val sizeLabel = TextView(this).apply {
-            text = "حجم الفرشاة: 32px"
+            text = "حجم الفرشاة: ٣٢"
             textSize = 12.5f
             setTextColor(0xFFB0B6C6.toInt())
         }
@@ -242,24 +276,27 @@ class EraserActivity : Activity() {
                 override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
                     val b = 8f + p * 0.6f
                     canvasView.brushDp = b
-                    sizeLabel.text = "حجم الفرشاة: ${b.toInt()}px"
+                    sizeLabel.text = "حجم الفرشاة: ${b.toInt()}"
                 }
                 override fun onStartTrackingTouch(s: SeekBar?) {}
                 override fun onStopTrackingTouch(s: SeekBar?) {}
             })
         }
         canvasView.brushDp = 8f + 40 * 0.6f
-        sizeRow.addView(sizeLabel, LinearLayout.LayoutParams(-2, -2).apply { rightMargin = dp(8) })
-        sizeRow.addView(seek, LinearLayout.LayoutParams(0, -2, 1f))
+        sizeRow.addView(seek, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(10) })
+        sizeRow.addView(sizeLabel)
         bottom.addView(sizeRow, LinearLayout.LayoutParams(-1, -2))
 
         // أزرار التنفيذ والمقارنة
-        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
         row.addView(
             pill("مسح التحديد", false) { if (!processing) canvasView.clearStrokes() },
             LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(5) }
         )
-        val compare = pill("قبل / بعد", false) {}
+        val compare = pill("الأصل / النتيجة", false) {}
         compare.setOnTouchListener { _, ev ->
             when (ev.actionMasked) {
                 MotionEvent.ACTION_DOWN -> canvasView.showPrevious(true)
@@ -269,14 +306,13 @@ class EraserActivity : Activity() {
         }
         row.addView(compare, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(5); rightMargin = dp(5) })
         row.addView(
-            pill("إزالة بالذكاء الاصطناعي ✨", true, accent) { if (!processing) runErase() },
-            LinearLayout.LayoutParams(0, -2, 1.45f).apply { leftMargin = dp(5) }
+            pill("إزالة العنصر الآن", true, accent) { if (!processing) runErase() },
+            LinearLayout.LayoutParams(0, -2, 1.35f).apply { leftMargin = dp(5) }
         )
         bottom.addView(row, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
         page.addView(bottom, LinearLayout.LayoutParams(-1, -2))
         root.addView(page, FrameLayout.LayoutParams(-1, -1))
 
-        // طبقة التقدم العصبي
         overlay = FrameLayout(this).apply {
             setBackgroundColor(0xCC000000.toInt())
             visibility = View.GONE
@@ -285,7 +321,7 @@ class EraserActivity : Activity() {
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            background = round(card, 22f, border)
+            background = round(colorCardDark, 22f, colorBorderSubtle)
             setPadding(dp(28), dp(24), dp(28), dp(20))
         }
         progressTv = TextView(this).apply {
@@ -326,15 +362,6 @@ class EraserActivity : Activity() {
             .setMessage(msg)
             .setPositiveButton("حسناً", null)
             .show()
-    }
-
-    private fun iconBtn(g: String, onClick: () -> Unit): TextView = TextView(this).apply {
-        text = g
-        textSize = 20f
-        setTextColor(Color.WHITE)
-        gravity = Gravity.CENTER
-        setPadding(dp(10), dp(6), dp(10), dp(6))
-        setOnClickListener { onClick() }
     }
 
     override fun onDestroy() {
@@ -449,7 +476,7 @@ class EraserActivity : Activity() {
                     saveBtn.alpha = 1f
                     Toast.makeText(
                         this,
-                        "تمت إزالة العنصر بنجاح في ${String.format(Locale.US, "%.1f", elapsedMs / 1000f)} ثانية ✨",
+                        "تمت إزالة العنصر بنجاح في ${String.format(Locale.US, "%.1f", elapsedMs / 1000f)} ثانية",
                         Toast.LENGTH_SHORT
                     ).show()
                 } else if (failed) {
@@ -491,7 +518,7 @@ class EraserActivity : Activity() {
             handler.post {
                 processing = false
                 if (ok) {
-                    Toast.makeText(this, "تم حفظ الصورة في ألبوم Mango Gallery ✨", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this, "تم حفظ الصورة في ألبوم Mango Gallery", Toast.LENGTH_LONG).show()
                     finish()
                 } else {
                     Toast.makeText(this, "تعذر حفظ الصورة", Toast.LENGTH_SHORT).show()
@@ -548,7 +575,7 @@ class EraseCanvasView(context: Context) : View(context) {
     private val loupeCrossPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = 1.5f * resources.displayMetrics.density
-        color = 0xFFFF9800.toInt()
+        color = 0xFF0A78D6.toInt()
     }
 
     private var fitted = false
@@ -699,7 +726,6 @@ class EraseCanvasView(context: Context) : View(context) {
         if (!showPrev) maskBmp?.let { canvas.drawBitmap(it, 0f, 0f, maskPaint) }
         canvas.restore()
 
-        // رسم عدسة التكبير الدقيقة (Precision Magnifier Loupe) في الزاوية أثناء اللمس والرسم
         if (touchActive && !zooming && !showPrev) {
             val loupeRadius = 56f * resources.displayMetrics.density
             val margin = 16f * resources.displayMetrics.density
