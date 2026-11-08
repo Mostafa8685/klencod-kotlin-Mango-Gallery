@@ -277,8 +277,11 @@ class MainActivity : Activity() {
 
     // مراجع القوائم لتحديثها فوراً بدون إعادة إنشاء الشاشة
     private var activePicturesAdapter: PicturesVirtualAdapter? = null
+    private var activeNormalTopBar: LinearLayout? = null
+    private var activeSelectionTopBar: LinearLayout? = null
     private var activeSelectionTitleTv: TextView? = null
     private var activeSelectAllTv: TextView? = null
+    private var lowEndSmoothMode: Boolean = false
 
     // التحديد المتعدد
     private var isSelectionMode = false
@@ -513,9 +516,7 @@ class MainActivity : Activity() {
         renderBottomNavigation()
         renderActiveScreen()
 
-        if (appLockEnabled && appLockPin.isNotEmpty()) {
-            lockGalleryNow(autoPromptBiometric = true)
-        }
+        // الخزنة الخاصة مستقلة تماماً (VaultActivity)؛ المعرض الرئيسي يفتح مباشرة بأقصى سرعة
 
         registerLiveMediaStoreObserver()
         requestMediaPermissionsIfNeeded()
@@ -705,6 +706,11 @@ class MainActivity : Activity() {
         picturesColumnCount = prefs.getInt("pictures_col_count", 3).coerceIn(2, 5)
         albumsColumnCount = prefs.getInt("albums_col_count", 3).coerceIn(2, 4)
         themeMode = prefs.getInt("theme_mode", 0)
+        val defaultLowEnd = try {
+            val am = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+            am.isLowRamDevice || am.memoryClass <= 160 || Runtime.getRuntime().availableProcessors() <= 4
+        } catch (_: Throwable) { false }
+        lowEndSmoothMode = prefs.getBoolean("low_end_smooth_mode", defaultLowEnd)
         appLockEnabled = prefs.getBoolean("app_lock_enabled", false)
         appLockPin = prefs.getString("app_lock_pin", "") ?: ""
         appLockPinLen = prefs.getInt("app_lock_pin_len", 0)
@@ -755,6 +761,7 @@ class MainActivity : Activity() {
             .putInt("pictures_col_count", picturesColumnCount)
             .putInt("albums_col_count", albumsColumnCount)
             .putInt("theme_mode", themeMode)
+            .putBoolean("low_end_smooth_mode", lowEndSmoothMode)
             .putBoolean("app_lock_enabled", appLockEnabled)
             .putString("app_lock_pin", appLockPin)
             .putInt("app_lock_pin_len", appLockPinLen)
@@ -1616,6 +1623,8 @@ class MainActivity : Activity() {
     private fun updateSelectionTopBarAndListInPlace() {
         val adapter = activePicturesAdapter
         if (adapter != null) {
+            activeNormalTopBar?.visibility = if (isSelectionMode) View.GONE else View.VISIBLE
+            activeSelectionTopBar?.visibility = if (isSelectionMode) View.VISIBLE else View.GONE
             adapter.notifyDataSetChanged()
             activeSelectionTitleTv?.text = if (selectedMediaIds.isEmpty()) {
                 "تحديد عناصر"
@@ -1778,6 +1787,8 @@ class MainActivity : Activity() {
     private fun renderActiveScreen() {
         activePicturesAdapter = null
         activePicturesListView = null
+        activeNormalTopBar = null
+        activeSelectionTopBar = null
         activeSelectionTitleTv = null
         activeSelectAllTv = null
         mainContentArea.removeAllViews()
@@ -1862,11 +1873,7 @@ class MainActivity : Activity() {
         )
 
         val lockBtn = makeTopIconButton(SamsungIconView.IconType.LOCK) {
-            if (appLockEnabled && appLockPin.isNotEmpty()) {
-                lockGalleryNow(autoPromptBiometric = true)
-            } else {
-                showAppLockSettingsDialog()
-            }
+            openVault()
         }
         normalTopBar.addView(
             lockBtn,
@@ -1922,9 +1929,63 @@ class MainActivity : Activity() {
         brandRow.addView(createAppLogoBadge(28))
         normalTopBar.addView(brandRow)
 
-        wrapper.addView(normalTopBar, LinearLayout.LayoutParams(-1, -2))
-
         val visibleItems = getVisibleMediaItems()
+
+        // شريط التحديد العلوي السريع (Selection Top Bar)
+        val selectionTopBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(14), dp(16), dp(8))
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+            visibility = if (isSelectionMode) View.VISIBLE else View.GONE
+        }
+
+        val cancelSelBtn = TextView(this).apply {
+            text = "إلغاء"
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(colorTextSecondary)
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+            setOnClickListener { exitSelectionModeFast() }
+        }
+        selectionTopBar.addView(cancelSelBtn)
+
+        val selectAllBtn = TextView(this).apply {
+            val allSelected = visibleItems.isNotEmpty() && selectedMediaIds.size >= visibleItems.size
+            text = if (allSelected) "إلغاء الكل" else "الكل"
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(colorSamsungBlue)
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            setOnClickListener {
+                val allNow = visibleItems.isNotEmpty() && selectedMediaIds.size >= visibleItems.size
+                if (allNow) {
+                    selectedMediaIds.clear()
+                } else {
+                    selectedMediaIds.addAll(visibleItems.map { it.id })
+                }
+                updateSelectionTopBarAndListInPlace()
+            }
+        }
+        activeSelectAllTv = selectAllBtn
+        selectionTopBar.addView(selectAllBtn)
+
+        val selTitleTv = TextView(this).apply {
+            text = if (selectedMediaIds.isEmpty()) "تحديد عناصر" else "تم تحديد ${toArabicDigits(selectedMediaIds.size)}"
+            textSize = 17.5f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(colorTextPrimary)
+            gravity = Gravity.RIGHT or Gravity.CENTER_VERTICAL
+        }
+        activeSelectionTitleTv = selTitleTv
+        selectionTopBar.addView(selTitleTv, LinearLayout.LayoutParams(0, -2, 1f))
+
+        activeNormalTopBar = normalTopBar
+        activeSelectionTopBar = selectionTopBar
+
+        wrapper.addView(normalTopBar, LinearLayout.LayoutParams(-1, -2))
+        wrapper.addView(selectionTopBar, LinearLayout.LayoutParams(-1, -2))
+
         if (visibleItems.isEmpty()) {
             wrapper.addView(buildEmptyOrPermissionPromptView(), LinearLayout.LayoutParams(-1, 0, 1f))
             return wrapper
@@ -3462,7 +3523,40 @@ class MainActivity : Activity() {
             },
             LinearLayout.LayoutParams(0, -2, 1f)
         )
-        for (k in 0 until 3) row3.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+        row3.addView(
+            makeHamburgerGridItem("إعدادات
+البصمة والقفل", SamsungIconView.IconType.FINGERPRINT) {
+                closeOverlay()
+                openVaultSecuritySettings()
+            },
+            LinearLayout.LayoutParams(0, -2, 1f)
+        )
+        row3.addView(
+            makeHamburgerGridItem("مسح أجسام
+بالذكاء AI", SamsungIconView.IconType.ERASER_BOX) {
+                closeOverlay()
+                val firstPhoto = getVisibleMediaItems().firstOrNull { !it.isVideo }
+                if (firstPhoto != null) {
+                    openObjectEraser(firstPhoto)
+                } else {
+                    Toast.makeText(this@MainActivity, "افتح أي صورة لاختيار مسح الأجسام بالذكاء الاصطناعي", Toast.LENGTH_SHORT).show()
+                }
+            },
+            LinearLayout.LayoutParams(0, -2, 1f)
+        )
+        row3.addView(
+            makeHamburgerGridItem("استوديو
+مونتاج الفيديو", SamsungIconView.IconType.EDIT_PEN) {
+                closeOverlay()
+                val firstVid = getVisibleMediaItems().firstOrNull { it.isVideo }
+                if (firstVid != null) {
+                    openVideoEditor(firstVid)
+                } else {
+                    Toast.makeText(this@MainActivity, "لا توجد مقاطع فيديو حالياً للمونتاج", Toast.LENGTH_SHORT).show()
+                }
+            },
+            LinearLayout.LayoutParams(0, -2, 1f)
+        )
         card.addView(
             row3,
             LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(24) }
@@ -3998,7 +4092,7 @@ class MainActivity : Activity() {
         val editBtn = makeViewerIconOnlyButton(SamsungIconView.IconType.EDIT_PEN, Color.WHITE) {
             val curr = list[currentIndex]
             if (curr.isVideo) {
-                openFullCinemaVideoPlayer(curr, list.filter { it.isVideo }.ifEmpty { list })
+                openVideoEditor(curr)
             } else {
                 showSamsungProPhotoEditor(curr)
             }
@@ -4151,7 +4245,12 @@ class MainActivity : Activity() {
             feedbackPill.animate().alpha(0f).setDuration(650L).start()
         }
 
-        // كبسولة الصوت العمودية على يمين الشاشة (مطابقة للصورة 1000036341.png تماماً!)
+        var currentBrightnessPercent = try {
+            val curB = window.attributes.screenBrightness
+            if (curB in 0.01f..1.0f) (curB * 100f).roundToInt() else 65
+        } catch (_: Exception) { 65 }
+
+        // كبسولة الصوت العمودية على يمين الشاشة
         val volumeVerticalPill = VerticalVolumeBarView(this, currentVolPercent).apply {
             visibility = View.GONE
         }
@@ -4168,6 +4267,23 @@ class MainActivity : Activity() {
             }.start()
         }
 
+        // كبسولة السطوع العمودية على يسار الشاشة
+        val brightnessVerticalPill = VerticalVolumeBarView(this, currentBrightnessPercent).apply {
+            visibility = View.GONE
+        }
+        root.addView(
+            brightnessVerticalPill,
+            FrameLayout.LayoutParams(dp(44), dp(196)).apply {
+                gravity = Gravity.CENTER_VERTICAL or Gravity.LEFT
+                leftMargin = dp(14)
+            }
+        )
+        val hideBrightnessRunnable = Runnable {
+            brightnessVerticalPill.animate().alpha(0f).setDuration(200L).withEndAction {
+                brightnessVerticalPill.visibility = View.GONE
+            }.start()
+        }
+
         fun showAndSetVolume(newPercent: Int) {
             currentVolPercent = newPercent.coerceIn(0, 100)
             val newStreamVol = ((currentVolPercent / 100f) * maxSysVol).roundToInt()
@@ -4180,6 +4296,22 @@ class MainActivity : Activity() {
             volumeVerticalPill.invalidate()
             handler.removeCallbacks(hideVolumeRunnable)
             handler.postDelayed(hideVolumeRunnable, 1600L)
+        }
+
+        fun showAndSetBrightness(newPercent: Int) {
+            currentBrightnessPercent = newPercent.coerceIn(5, 100)
+            try {
+                val lp = window.attributes
+                lp.screenBrightness = currentBrightnessPercent / 100f
+                window.attributes = lp
+            } catch (_: Exception) {}
+            brightnessVerticalPill.levelPercent = currentBrightnessPercent
+            brightnessVerticalPill.visibility = View.VISIBLE
+            brightnessVerticalPill.alpha = 1f
+            brightnessVerticalPill.invalidate()
+            flashFeedback("السطوع ${toArabicDigits(currentBrightnessPercent)}%")
+            handler.removeCallbacks(hideBrightnessRunnable)
+            handler.postDelayed(hideBrightnessRunnable, 1400L)
         }
 
         // طبقة عناصر التحكم الكاملة (تختفي وتظهر باللمس)
@@ -4297,6 +4429,56 @@ class MainActivity : Activity() {
             flashFeedback("تم حفظ لقطة GIF متحركة من المشهد الحالي")
         }
         captureToolsRow.addView(gifBtn, LinearLayout.LayoutParams(dp(38), dp(38)).apply { leftMargin = dp(8) })
+
+        val proMontagePill = TextView(this).apply {
+            text = "✂️ مونتاج وقص"
+            textSize = 12f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+            background = GradientDrawable().apply {
+                setColor(0xBB0A78D6.toInt())
+                cornerRadius = dpF(16f)
+            }
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            setOnClickListener {
+                val curr = videos[vidIdx]
+                try { videoView.pause() } catch (_: Exception) {}
+                openVideoEditor(curr)
+            }
+        }
+        captureToolsRow.addView(proMontagePill, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(8) })
+
+        val speedQuickPill = TextView(this).apply {
+            text = "1.0x"
+            textSize = 12f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(colorBrandIceBlue)
+            background = GradientDrawable().apply {
+                setColor(0x991C1C22.toInt())
+                cornerRadius = dpF(16f)
+                setStroke(dp(1), 0x44FFFFFF)
+            }
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+            setOnClickListener {
+                currentSpeed = when (currentSpeed) {
+                    1.0f -> 1.25f
+                    1.25f -> 1.5f
+                    1.5f -> 2.0f
+                    2.0f -> 0.5f
+                    else -> 1.0f
+                }
+                text = "${currentSpeed}x"
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    try {
+                        mediaPlayerRef?.let { mp ->
+                            mp.playbackParams = (mp.playbackParams ?: PlaybackParams()).setSpeed(currentSpeed)
+                        }
+                    } catch (_: Exception) {}
+                }
+                flashFeedback("السرعة ${currentSpeed}x")
+            }
+        }
+        captureToolsRow.addView(speedQuickPill, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(6) })
 
         controlsOverlay.addView(
             captureToolsRow,
@@ -4588,9 +4770,12 @@ class MainActivity : Activity() {
                     if (isTouchLocked || e1 == null) return false
                     if (abs(distanceY) > abs(distanceX) * 1.3f) {
                         val w = videoSurfaceHolder.width.coerceAtLeast(1)
+                        val deltaPercent = ((distanceY / dpF(180f)) * 100f).roundToInt()
                         if (e1.x > w * 0.5f) {
-                            val deltaPercent = ((distanceY / dpF(180f)) * 100f).roundToInt()
                             showAndSetVolume(currentVolPercent + deltaPercent)
+                            return true
+                        } else {
+                            showAndSetBrightness(currentBrightnessPercent + deltaPercent)
                             return true
                         }
                     }
@@ -4786,28 +4971,35 @@ class MainActivity : Activity() {
     }
 
     private fun showViewerMoreMenu(media: MediaItem, onRefresh: () -> Unit) {
+        val aiOrVideoLabel = if (media.isVideo) "استوديو مونتاج وقص الفيديو 🎬" else "مسح أجسام بالذكاء الاصطناعي العصبي ✨"
         val options = arrayOf(
+            aiOrVideoLabel,
+            "نقل إلى الخزنة الخاصة المشفّرة 🔒",
             "التفاصيل ومعلومات الملف (EXIF)",
             "إعادة تسمية الملف",
             "نقل إلى ألبوم",
             "تعيين كخلفية للهاتف",
-            "بدء عرض الشرائح",
-            "إزالة عنصر من الصورة ✨"
+            "بدء عرض الشرائح"
         )
         AlertDialog.Builder(this)
             .setTitle(media.title)
             .setItems(options) { _, which ->
                 when (which) {
-                    0 -> showMediaDetailsSheet(media)
-                    1 -> showRenameMediaDialog(media, onRefresh)
-                    2 -> {
+                    0 -> if (media.isVideo) openVideoEditor(media) else openObjectEraser(media)
+                    1 -> {
+                        selectedMediaIds.clear()
+                        selectedMediaIds.add(media.id)
+                        moveSelectedToVault()
+                    }
+                    2 -> showMediaDetailsSheet(media)
+                    3 -> showRenameMediaDialog(media, onRefresh)
+                    4 -> {
                         selectedMediaIds.clear()
                         selectedMediaIds.add(media.id)
                         showAddSelectedToAlbumDialog()
                     }
-                    3 -> setAsDeviceWallpaper(media)
-                    4 -> startSlideshow(getVisibleMediaItems())
-                    5 -> openObjectEraser(media)
+                    5 -> setAsDeviceWallpaper(media)
+                    6 -> startSlideshow(getVisibleMediaItems())
                 }
             }
             .show()
@@ -5496,6 +5688,9 @@ class MainActivity : Activity() {
                     }
 
                     val advancedCards = listOf(
+                        BottomAction("مسح الأجسام AI", SamsungIconView.IconType.ERASER_BOX) {
+                            openObjectEraser(media)
+                        },
                         BottomAction("مزيج الألوان", SamsungIconView.IconType.PALETTE_MIX) {
                             editorCanvasView.warmthLevel = if (editorCanvasView.warmthLevel == 0) 35 else 0
                             editorCanvasView.saturationLevel = 25
@@ -5686,7 +5881,7 @@ class MainActivity : Activity() {
             }
             val decodeOpts = BitmapFactory.Options().apply {
                 inSampleSize = sample
-                inPreferredConfig = Bitmap.Config.ARGB_8888
+                inPreferredConfig = if (lowEndSmoothMode && maxDimension <= 640) Bitmap.Config.RGB_565 else Bitmap.Config.ARGB_8888
                 inScaled = false
             }
             val rawBmp = contentResolver.openInputStream(media.contentUri)?.use {
@@ -6201,74 +6396,341 @@ class MainActivity : Activity() {
     }
 
     private fun showGallerySettingsDialog() {
-        val themeLabel = when (themeMode) {
-            1 -> "المظهر: داكن دائماً"
-            2 -> "المظهر: فاتح دائماً"
-            else -> "المظهر: تلقائي حسب الجهاز (${if (isDarkModeActive()) "داكن حالياً" else "فاتح حالياً"})"
-        }
-        val lockStatusLabel = if (appLockEnabled && appLockPin.isNotEmpty()) {
-            "قفل الاستديو: مفعّل (كلمة سر + بصمة)"
-        } else {
-            "قفل الاستديو: غير مفعّل (اضغط للتفعيل)"
+        overlayLayer.removeAllViews()
+        overlayLayer.visibility = View.VISIBLE
+
+        val hwProfile = ObjectEraser.detectHardwareProfile(this)
+        val vaultCount = try { PrivateVault.list(this).size } catch (_: Throwable) { 0 }
+        val trashCount = getTrashedMediaItems().size
+        val visibleMedia = getVisibleMediaItems()
+        val pCount = visibleMedia.count { !it.isVideo }
+        val vCount = visibleMedia.count { it.isVideo }
+
+        val page = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(colorPureBlack)
+            isClickable = true
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
         }
 
-        val items = arrayOf(
-            themeLabel,
-            lockStatusLabel,
-            "قفل الاستديو الآن",
-            "سلة المحذوفات (٣٠ يوماً داخل التطبيق • ${toArabicDigits(getTrashedMediaItems().size)} عنصر)",
-            "إعادة إظهار بطاقة تخصيص الألبومات",
-            "تغيير عدد أعمدة الصور (حالياً: ${toArabicDigits(picturesColumnCount)} أعمدة)",
-            "إظهار كل الألبومات المخفية",
-            "إعادة فحص وتحديث صور الهاتف",
-            "السماح بإدارة الوسائط (حذف بدون نافذة تأكيد)",
-            "الخزنة الخاصة 🔒"
-        )
-        AlertDialog.Builder(this)
-            .setTitle("ضبط Mango Gallery")
-            .setItems(items) { _, which ->
-                when (which) {
-                    0 -> showThemeModeSelectorDialog()
-                    1 -> showAppLockSettingsDialog()
-                    2 -> {
-                        if (appLockEnabled && appLockPin.isNotEmpty()) {
-                            lockGalleryNow(autoPromptBiometric = true)
-                        } else {
-                            showSetPasswordDialog(lockImmediatelyAfter = true)
-                        }
-                    }
-                    3 -> openRecycleBinSubPage()
-                    4 -> {
-                        showCustomizeAlbumsBanner = true
-                        savePersistedState()
-                        renderActiveScreen()
-                    }
-                    5 -> {
-                        picturesColumnCount = when (picturesColumnCount) {
-                            3 -> 4
-                            4 -> 5
-                            5 -> 2
-                            else -> 3
-                        }
-                        savePersistedState()
-                        renderActiveScreen()
-                    }
-                    6 -> {
-                        hiddenAlbumNames.clear()
-                        nonEssentialAlbumNames.clear()
-                        savePersistedState()
-                        renderActiveScreen()
-                    }
-                    7 -> {
-                        requestMediaPermissionsIfNeeded()
-                        Toast.makeText(this, "جاري تحديث صور وفيديوهات الهاتف...", Toast.LENGTH_SHORT).show()
-                    }
-                    8 -> openManageMediaSettings()
-                    9 -> openVault()
-                }
+        // الشريط العلوي الاحترافي
+        val topBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(18), dp(16), dp(12))
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+        val closeBtn = makeTopIconButton(SamsungIconView.IconType.CHEVRON_RIGHT, colorTextPrimary) {
+            closeOverlay()
+        }
+        val headerTitle = TextView(this).apply {
+            text = "إعدادات Mango Gallery الاحترافية"
+            textSize = 20f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(colorTextPrimary)
+            gravity = Gravity.RIGHT or Gravity.CENTER_VERTICAL
+        }
+        topBar.addView(headerTitle, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(8) })
+        topBar.addView(closeBtn, LinearLayout.LayoutParams(dp(40), dp(40)))
+        page.addView(topBar, LinearLayout.LayoutParams(-1, -2))
+
+        val scroll = ScrollView(this).apply {
+            isVerticalScrollBarEnabled = false
+        }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(6), dp(16), dp(36))
+        }
+
+        fun makeSectionTitle(title: String): TextView = TextView(this).apply {
+            text = title
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(colorSamsungBlue)
+            gravity = Gravity.RIGHT
+            setPadding(dp(8), dp(14), dp(8), dp(6))
+        }
+
+        fun makeCard(): LinearLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = GradientDrawable().apply {
+                setColor(colorCardDark)
+                cornerRadius = dpF(22f)
+                setStroke(dp(1), colorBorderSubtle)
             }
-            .setPositiveButton("إغلاق", null)
-            .show()
+            setPadding(dp(16), dp(10), dp(16), dp(10))
+        }
+
+        fun makeSettingRow(
+            title: String,
+            subtitle: String,
+            badgeText: String? = null,
+            badgeColor: Int = colorSamsungBlue,
+            showDivider: Boolean = true,
+            onClick: () -> Unit
+        ): View {
+            val col = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                isClickable = true
+                setPadding(dp(4), dp(12), dp(4), dp(12))
+                setOnClickListener { onClick() }
+            }
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                layoutDirection = View.LAYOUT_DIRECTION_LTR
+            }
+            if (badgeText != null) {
+                val badge = TextView(this).apply {
+                    text = badgeText
+                    textSize = 11.5f
+                    typeface = Typeface.DEFAULT_BOLD
+                    setTextColor(Color.WHITE)
+                    background = GradientDrawable().apply {
+                        setColor(badgeColor)
+                        cornerRadius = dpF(12f)
+                    }
+                    setPadding(dp(10), dp(4), dp(10), dp(4))
+                }
+                row.addView(badge, LinearLayout.LayoutParams(-2, -2).apply { rightMargin = dp(10) })
+            }
+            val textCol = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.RIGHT
+            }
+            textCol.addView(TextView(this).apply {
+                text = title
+                textSize = 15.5f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(colorTextPrimary)
+                gravity = Gravity.RIGHT
+            })
+            textCol.addView(TextView(this).apply {
+                text = subtitle
+                textSize = 12.5f
+                setTextColor(colorTextSecondary)
+                gravity = Gravity.RIGHT
+                setPadding(0, dp(2), 0, 0)
+            })
+            row.addView(textCol, LinearLayout.LayoutParams(0, -2, 1f))
+            col.addView(row, LinearLayout.LayoutParams(-1, -2))
+            if (showDivider) {
+                val div = View(this).apply { setBackgroundColor(colorBorderSubtle) }
+                col.addView(div, LinearLayout.LayoutParams(-1, dp(1)).apply { topMargin = dp(12) })
+            }
+            return col
+        }
+
+        // 1. بطاقة الهوية والإحصائيات الحية (Hero Enterprise Card)
+        val heroCard = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TL_BR,
+                intArrayOf(0xFF0A3966.toInt(), 0xFF101828.toInt())
+            ).apply {
+                cornerRadius = dpF(24f)
+                setStroke(dp(1), 0x448CD0FA)
+            }
+            setPadding(dp(18), dp(18), dp(18), dp(18))
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+        val heroInfoCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.RIGHT
+        }
+        heroInfoCol.addView(TextView(this).apply {
+            text = "Mango Gallery Pro"
+            textSize = 19f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+            gravity = Gravity.RIGHT
+        })
+        heroInfoCol.addView(TextView(this).apply {
+            text = "${toArabicDigits(pCount)} صورة • ${toArabicDigits(vCount)} فيديو • ${toArabicDigits(deviceAudioTracks.size)} صوتيات"
+            textSize = 12.5f
+            setTextColor(colorBrandIceBlue)
+            gravity = Gravity.RIGHT
+            setPadding(0, dp(4), 0, 0)
+        })
+        heroInfoCol.addView(TextView(this).apply {
+            text = "⚡ المحرك العصبي: ${hwProfile.acceleratorName}"
+            textSize = 11.5f
+            setTextColor(0xFFD0E2F8.toInt())
+            gravity = Gravity.RIGHT
+            setPadding(0, dp(2), 0, 0)
+        })
+        heroCard.addView(heroInfoCol, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(14) })
+        heroCard.addView(createAppLogoBadge(54))
+        content.addView(heroCard, LinearLayout.LayoutParams(-1, -2))
+
+        // 2. قسم الخزنة الخاصة المشفّرة والقياسات الحيوية (البصمة)
+        content.addView(makeSectionTitle("🔒 الخزنة الخاصة والحماية البيومترية"))
+        val vaultCard = makeCard()
+        vaultCard.addView(makeSettingRow(
+            title = "فتح الخزنة الخاصة المشفّرة",
+            subtitle = "تحتوي حالياً على ${toArabicDigits(vaultCount)} عنصر مخفي ومشفّر بـ AES-256 بعيداً عن المعرض العام",
+            badgeText = "فتح الخزنة",
+            badgeColor = colorSamsungBlue,
+            showDivider = true
+        ) {
+            closeOverlay()
+            openVault()
+        })
+        vaultCard.addView(makeSettingRow(
+            title = "صفحة تعديل كلمة المرور والبصمة وسؤال الأمان",
+            subtitle = "تغيير رمز PIN، وتفعيل بصمة الوجه أو البصمة الجانبية/الخلفية/الشاشة حسب هاتفك",
+            badgeText = "إدارة الأمان",
+            badgeColor = 0xFFFF9800.toInt(),
+            showDivider = false
+        ) {
+            closeOverlay()
+            openVaultSecuritySettings()
+        })
+        content.addView(vaultCard, LinearLayout.LayoutParams(-1, -2))
+
+        // 3. قسم الأداء الفائق للأجهزة الضعيفة والمحرك العصبي
+        content.addView(makeSectionTitle("🚀 الأداء والسلاسة والذكاء الاصطناعي العصبي"))
+        val perfCard = makeCard()
+        perfCard.addView(makeSettingRow(
+            title = "وضع السلاسة الفائقة للأجهزة الضعيفة (Turbo 60/120Hz)",
+            subtitle = if (lowEndSmoothMode)
+                "مفعّل: يقلل استهلاك الرام بترميز RGB_565 ويسرّع التمرير الفوري دون تقطيع"
+            else
+                "غير مفعّل: يعرض المصغرات بدقة لونية قصوى ARGB_8888 للأجهزة القوية",
+            badgeText = if (lowEndSmoothMode) "مفعّل ✓" else "تفعيل",
+            badgeColor = if (lowEndSmoothMode) 0xFF2E7D32.toInt() else 0xFF424248.toInt(),
+            showDivider = true
+        ) {
+            lowEndSmoothMode = !lowEndSmoothMode
+            savePersistedState()
+            bitmapCache.evictAll()
+            showGallerySettingsDialog()
+            Toast.makeText(
+                this,
+                if (lowEndSmoothMode) "تم تفعيل وضع السلاسة الفائقة للأجهزة الضعيفة ⚡" else "تم تفعيل وضع الدقة القصوى",
+                Toast.LENGTH_SHORT
+            ).show()
+        })
+        perfCard.addView(makeSettingRow(
+            title = "معالج الذكاء الاصطناعي المحلي (Neural Object Eraser)",
+            subtitle = "${hwProfile.displayTitleAr} • ${hwProfile.chipSummary}",
+            badgeText = hwProfile.id.uppercase(Locale.ROOT),
+            badgeColor = colorSamsungBlue,
+            showDivider = false
+        ) {
+            AlertDialog.Builder(this)
+                .setTitle("المحرك العصبي المحلي (On-Device NPU/CPU)")
+                .setMessage(
+                    "يتم تشغيل نموذج مسح الأجسام محلياً على معالج هاتفك:
+
+" +
+                    "• المعالج: ${hwProfile.chipSummary}
+" +
+                    "• المسرّع: ${hwProfile.acceleratorName}
+" +
+                    "• الوضع التلقائي: ${hwProfile.displayTitleAr}
+
+" +
+                    "يمكنك استخدام الممحاة الذكية من خلال فتح أي صورة ثم اختيار (تعديل) أو (مسح أجسام بالذكاء الاصطناعي ✨)."
+                )
+                .setPositiveButton("حسناً", null)
+                .show()
+        })
+        content.addView(perfCard, LinearLayout.LayoutParams(-1, -2))
+
+        // 4. قسم المظهر وتخصيص الشبكة والألبومات
+        content.addView(makeSectionTitle("🎨 المظهر وتخصيص العرض والويدجت"))
+        val uiCard = makeCard()
+        val themeStr = when (themeMode) {
+            1 -> "الوضع الداكن دائماً"
+            2 -> "الوضع الفاتح دائماً"
+            else -> "تلقائي حسب النظام (${if (isDarkModeActive()) "داكن" else "فاتح"})"
+        }
+        uiCard.addView(makeSettingRow(
+            title = "مظهر التطبيق والثيم",
+            subtitle = "الحالي: $themeStr",
+            badgeText = "تغيير",
+            showDivider = true
+        ) {
+            showThemeModeSelectorDialog()
+        })
+        uiCard.addView(makeSettingRow(
+            title = "عدد أعمدة شبكة الصور",
+            subtitle = "الحالي: ${toArabicDigits(picturesColumnCount)} أعمدة (يمكنك أيضاً التكبير والتصغير بإصبعين)",
+            badgeText = "${toArabicDigits(picturesColumnCount)}×",
+            showDivider = true
+        ) {
+            picturesColumnCount = when (picturesColumnCount) {
+                2 -> 3
+                3 -> 4
+                4 -> 5
+                else -> 2
+            }
+            savePersistedState()
+            renderActiveScreen()
+            showGallerySettingsDialog()
+        })
+        uiCard.addView(makeSettingRow(
+            title = "إظهار كل الألبومات المخفية واستعادة الترتيب",
+            subtitle = "إعادة إظهار أي ألبوم تم إخفاؤه سابقاً وتحديث القائمة",
+            showDivider = true
+        ) {
+            hiddenAlbumNames.clear()
+            nonEssentialAlbumNames.clear()
+            showCustomizeAlbumsBanner = true
+            savePersistedState()
+            renderActiveScreen()
+            Toast.makeText(this, "تم إظهار كافة الألبومات", Toast.LENGTH_SHORT).show()
+        })
+        uiCard.addView(makeSettingRow(
+            title = "تحديث ويدجت الشاشة الرئيسية (Mango Widgets)",
+            subtitle = "تحديث ويدجت الذكريات والطقس وويدجت مركز التحكم السريع على الشاشة الرئيسية",
+            badgeText = "تحديث",
+            showDivider = false
+        ) {
+            sendBroadcast(Intent(this, MangoPhotoWidgetProvider::class.java).apply {
+                action = MangoPhotoWidgetProvider.ACTION_REFRESH
+            })
+            Toast.makeText(this, "تم تحديث ويدجت الشاشة الرئيسية ✨", Toast.LENGTH_SHORT).show()
+        })
+        content.addView(uiCard, LinearLayout.LayoutParams(-1, -2))
+
+        // 5. قسم إدارة الملفات وسلة المحذوفات
+        content.addView(makeSectionTitle("🗂️ إدارة الوسائط وسلة المحذوفات"))
+        val storageCard = makeCard()
+        storageCard.addView(makeSettingRow(
+            title = "سلة المحذوفات (تحتفظ بالملفات ٣٠ يوماً)",
+            subtitle = "تحتوي حالياً على ${toArabicDigits(trashCount)} عنصر قابل للاستعادة",
+            badgeText = "${toArabicDigits(trashCount)}",
+            badgeColor = if (trashCount > 0) 0xFFE65A0F.toInt() else 0xFF424248.toInt(),
+            showDivider = true
+        ) {
+            closeOverlay()
+            openRecycleBinSubPage()
+        })
+        storageCard.addView(makeSettingRow(
+            title = "السماح بإدارة الوسائط السريعة (Manage Media)",
+            subtitle = "حذف ونقل الصور للخزنة بدون نوافذ تأكيد متكررة من النظام",
+            showDivider = true
+        ) {
+            openManageMediaSettings()
+        })
+        storageCard.addView(makeSettingRow(
+            title = "إعادة فحص وتحديث كافة صور وفيديوهات الهاتف",
+            subtitle = "مزامنة فورية مع MediaStore لاكتشاف أحدث الملفات",
+            showDivider = false
+        ) {
+            closeOverlay()
+            requestMediaPermissionsIfNeeded()
+            Toast.makeText(this, "جاري فحص وتحديث الوسائط...", Toast.LENGTH_SHORT).show()
+        })
+        content.addView(storageCard, LinearLayout.LayoutParams(-1, -2))
+
+        scroll.addView(content)
+        page.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+        overlayLayer.addView(page, FrameLayout.LayoutParams(-1, -1))
+        animateSlideUpIn(page, distanceDp = 48, durationMs = 160L)
     }
 
     private fun showThemeModeSelectorDialog() {
@@ -7310,6 +7772,27 @@ class MainActivity : Activity() {
         startActivity(Intent(this, VaultActivity::class.java))
     }
 
+    private fun openVaultSecuritySettings() {
+        markExternalLaunch()
+        val i = Intent(this, VaultActivity::class.java).apply {
+            putExtra(VaultActivity.EXTRA_OPEN_SECURITY_PAGE, true)
+        }
+        startActivity(i)
+    }
+
+    private fun openVideoEditor(media: MediaItem) {
+        if (!media.isVideo) {
+            showSamsungProPhotoEditor(media)
+            return
+        }
+        markExternalLaunch()
+        val i = Intent(this, VideoEditorActivity::class.java).apply {
+            putExtra(VideoEditorActivity.EXTRA_VIDEO_URI, media.contentUri)
+            putExtra(VideoEditorActivity.EXTRA_VIDEO_TITLE, media.title)
+        }
+        startActivity(i)
+    }
+
     private fun moveSelectedToVault() {
         val visibleMap = getVisibleMediaItems().associateBy { it.id }
         val uris = ArrayList<Uri>()
@@ -7422,10 +7905,18 @@ class MainActivity : Activity() {
         cellPx: Int,
         cellView: FastGridCellView
     ): Bitmap? {
-        val bucketSize = when {
-            cellPx >= 700 -> 1024
-            cellPx >= 420 -> 640
-            else -> 480
+        val bucketSize = if (lowEndSmoothMode) {
+            when {
+                cellPx >= 700 -> 640
+                cellPx >= 420 -> 420
+                else -> 300
+            }
+        } else {
+            when {
+                cellPx >= 700 -> 1024
+                cellPx >= 420 -> 640
+                else -> 480
+            }
         }
         val cacheKey = "${media.id}_$bucketSize"
         bitmapCache.get(cacheKey)?.let {

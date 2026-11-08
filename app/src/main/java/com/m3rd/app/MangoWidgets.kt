@@ -19,10 +19,16 @@ import android.os.Build
 import android.provider.MediaStore
 import android.util.Size
 import android.widget.RemoteViews
+import java.text.SimpleDateFormat
 import java.util.Calendar
+import java.util.Date
+import java.util.Locale
 import java.util.Random
 
-/** ودجت صورة: "ذكريات مثل اليوم" من السنوات السابقة، وإلا صورة عشوائية من الأحدث. */
+/**
+ * ودجت الذكريات واللحظات المميزة (بستايل ويدجت الطقس والتطبيقات الكبرى):
+ * يعرض التاريخ العربي الحي + شارة حالة الذكرى + إحصائيات المعرض + صورة متجددة بحواف دائرية أنيقة + زر تحديث فوري.
+ */
 class MangoPhotoWidgetProvider : AppWidgetProvider() {
 
     companion object {
@@ -39,19 +45,34 @@ class MangoPhotoWidgetProvider : AppWidgetProvider() {
             }
         }
 
-        private class Pick(val uri: Uri, val year: Int, val memory: Boolean)
+        private class Pick(
+            val uri: Uri,
+            val year: Int,
+            val memory: Boolean,
+            val totalPhotos: Int,
+            val bucketName: String
+        )
 
         private fun pickPhoto(ctx: Context): Pick? {
-            val proj = arrayOf(MediaStore.Images.Media._ID, MediaStore.Images.Media.DATE_TAKEN, MediaStore.Images.Media.DATE_ADDED)
+            val proj = arrayOf(
+                MediaStore.Images.Media._ID,
+                MediaStore.Images.Media.DATE_TAKEN,
+                MediaStore.Images.Media.DATE_ADDED,
+                MediaStore.Images.Media.BUCKET_DISPLAY_NAME
+            )
             val today = Calendar.getInstance()
             val ids = ArrayList<Long>()
+            val buckets = ArrayList<String>()
             val memIds = ArrayList<Long>()
             val memYears = ArrayList<Int>()
+            val memBuckets = ArrayList<String>()
+            var totalCount = 0
             try {
                 ctx.contentResolver.query(
                     MediaStore.Images.Media.EXTERNAL_CONTENT_URI, proj, null, null,
                     MediaStore.Images.Media.DATE_ADDED + " DESC"
                 )?.use { c ->
+                    totalCount = c.count
                     val cal = Calendar.getInstance()
                     var rows = 0
                     while (c.moveToNext() && rows < MAX_ROWS) {
@@ -59,7 +80,9 @@ class MangoPhotoWidgetProvider : AppWidgetProvider() {
                         val id = c.getLong(0)
                         var t = c.getLong(1)
                         if (t <= 0L) t = c.getLong(2) * 1000L
+                        val bName = c.getString(3) ?: "الكاميرا"
                         ids.add(id)
+                        buckets.add(bName)
                         cal.timeInMillis = t
                         if (cal.get(Calendar.MONTH) == today.get(Calendar.MONTH) &&
                             cal.get(Calendar.DAY_OF_MONTH) == today.get(Calendar.DAY_OF_MONTH) &&
@@ -67,6 +90,7 @@ class MangoPhotoWidgetProvider : AppWidgetProvider() {
                         ) {
                             memIds.add(id)
                             memYears.add(cal.get(Calendar.YEAR))
+                            memBuckets.add(bName)
                         }
                     }
                 }
@@ -76,10 +100,22 @@ class MangoPhotoWidgetProvider : AppWidgetProvider() {
             val rnd = Random()
             return if (memIds.isNotEmpty()) {
                 val k = rnd.nextInt(memIds.size)
-                Pick(ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, memIds[k]), memYears[k], true)
+                Pick(
+                    ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, memIds[k]),
+                    memYears[k],
+                    true,
+                    totalCount,
+                    memBuckets[k]
+                )
             } else if (ids.isNotEmpty()) {
-                val id = ids[rnd.nextInt(ids.size)]
-                Pick(ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id), 0, false)
+                val k = rnd.nextInt(ids.size)
+                Pick(
+                    ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, ids[k]),
+                    0,
+                    false,
+                    totalCount,
+                    buckets[k]
+                )
             } else null
         }
 
@@ -110,7 +146,9 @@ class MangoPhotoWidgetProvider : AppWidgetProvider() {
         }
 
         private fun openAppIntent(ctx: Context, code: Int): PendingIntent {
-            val i = Intent(ctx, MainActivity::class.java).apply { flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP }
+            val i = Intent(ctx, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            }
             return PendingIntent.getActivity(ctx, code, i, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         }
 
@@ -123,23 +161,36 @@ class MangoPhotoWidgetProvider : AppWidgetProvider() {
             )
             views.setOnClickPendingIntent(R.id.widget_root, openAppIntent(ctx, 1))
 
+            val dateStr = try {
+                SimpleDateFormat("EEEE، d MMMM", Locale("ar")).format(Date())
+            } catch (_: Throwable) {
+                "اليوم"
+            }
+            views.setTextViewText(R.id.widget_date_badge, "☀️ $dateStr")
+
             if (!hasMediaPermission(ctx)) {
                 views.setImageViewBitmap(R.id.widget_image, null)
-                views.setTextViewText(R.id.widget_caption, "افتح Mango Gallery لمنح الإذن")
+                views.setTextViewText(R.id.widget_caption, "Mango Gallery")
+                views.setTextViewText(R.id.widget_subcaption, "اضغط لمنح إذن عرض الذكريات والصور")
                 mgr.updateAppWidget(id, views)
                 return
             }
             val pick = pickPhoto(ctx)
-            val bmp = if (pick != null) loadThumb(ctx, pick.uri, 480) else null
+            val bmp = if (pick != null) loadThumb(ctx, pick.uri, 520) else null
             if (pick == null || bmp == null) {
                 views.setImageViewBitmap(R.id.widget_image, null)
-                views.setTextViewText(R.id.widget_caption, "Mango Gallery")
+                views.setTextViewText(R.id.widget_caption, "Mango Gallery ✨")
+                views.setTextViewText(R.id.widget_subcaption, "التقط صوراً جديدة لتظهر ذكرياتك هنا")
             } else {
                 val r = 22f * ctx.resources.displayMetrics.density * (bmp.width / 360f)
                 views.setImageViewBitmap(R.id.widget_image, rounded(bmp, r))
                 views.setTextViewText(
                     R.id.widget_caption,
-                    if (pick.memory) "ذكرى من ${pick.year}" else "Mango Gallery"
+                    if (pick.memory) "✨ ذكرى مثل هذا اليوم (${pick.year})" else "📸 لقطة مميزة • ${pick.bucketName}"
+                )
+                views.setTextViewText(
+                    R.id.widget_subcaption,
+                    "Mango Gallery • ${pick.totalPhotos} صورة في معرضك"
                 )
             }
             mgr.updateAppWidget(id, views)
@@ -167,8 +218,27 @@ class MangoPhotoWidgetProvider : AppWidgetProvider() {
     }
 }
 
-/** ودجت وصول سريع: الكاميرا • المعرض • الخزنة (تتطلب كلمة السر عند الفتح). */
+/**
+ * ودجت مركز التحكم الذكي (Mango Smart Hub Widget):
+ * يعرض إحصائيات المعرض الحية + أزرار وصول فوري للكاميرا، المعرض، الخزنة الخاصة المشفّرة، واستوديو الذكاء الاصطناعي.
+ */
 class MangoQuickWidgetProvider : AppWidgetProvider() {
+
+    private fun countMedia(ctx: Context): Pair<Int, Int> {
+        var photos = 0
+        var videos = 0
+        try {
+            ctx.contentResolver.query(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                arrayOf(MediaStore.Images.Media._ID), null, null, null
+            )?.use { photos = it.count }
+            ctx.contentResolver.query(
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                arrayOf(MediaStore.Video.Media._ID), null, null, null
+            )?.use { videos = it.count }
+        } catch (_: Throwable) {}
+        return Pair(photos, videos)
+    }
 
     override fun onUpdate(context: Context, appWidgetManager: AppWidgetManager, appWidgetIds: IntArray) {
         val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
@@ -179,16 +249,27 @@ class MangoQuickWidgetProvider : AppWidgetProvider() {
         )
         val gallery = PendingIntent.getActivity(
             context, 22,
-            Intent(context, MainActivity::class.java).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP) },
+            Intent(context, MainActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            },
             flags
         )
         val vault = PendingIntent.getActivity(
             context, 23,
-            Intent(context, VaultActivity::class.java).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP) },
+            Intent(context, VaultActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            },
             flags
         )
+        val (pCount, vCount) = countMedia(context)
+        val vaultCount = try { PrivateVault.list(context).size } catch (_: Throwable) { 0 }
+
         for (id in appWidgetIds) {
             val v = RemoteViews(context.packageName, R.layout.mango_widget_quick)
+            v.setTextViewText(
+                R.id.quick_stats_header,
+                "Mango Gallery • $pCount صورة • $vCount فيديو • 🔒 $vaultCount بالخزنة"
+            )
             v.setOnClickPendingIntent(R.id.quick_camera, camera)
             v.setOnClickPendingIntent(R.id.quick_gallery, gallery)
             v.setOnClickPendingIntent(R.id.quick_vault, vault)

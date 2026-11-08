@@ -19,13 +19,16 @@
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="29" />
 
-    <!-- أذونات البصمة والحماية البيومترية لقفل الاستديو -->
+    <!-- أذونات البصمة والحماية البيومترية للخزنة الخاصة (بصمة الشاشة / الجانبية / الخلفية / الوجه) -->
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+    <uses-permission android:name="android.permission.USE_FINGERPRINT" />
 
     <application
         android:allowBackup="false"
         android:fullBackupContent="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
+        android:hardwareAccelerated="true"
+        android:largeHeap="true"
         android:icon="@drawable/app_icon"
         android:label="@string/app_name"
         android:roundIcon="@drawable/app_icon"
@@ -43,7 +46,7 @@
             </intent-filter>
         </activity>
 
-        <!-- الخزنة الخاصة (مشفّرة، بكلمة سر وبصمة مستقلتين) -->
+        <!-- الخزنة الخاصة (مشفّرة بـ AES-256، بكلمة سر وبصمة مستقلتين) -->
         <activity
             android:name=".VaultActivity"
             android:exported="false"
@@ -52,9 +55,17 @@
             android:screenOrientation="portrait"
             android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />
 
-        <!-- إزالة العناصر من الصور -->
+        <!-- إزالة العناصر من الصور بالذكاء الاصطناعي العصبي المحلي -->
         <activity
             android:name=".EraserActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|uiMode"
+            android:screenOrientation="portrait"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />
+
+        <!-- استوديو محرر الفيديو والمونتاج الاحترافي -->
+        <activity
+            android:name=".VideoEditorActivity"
             android:exported="false"
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|uiMode"
             android:screenOrientation="portrait"
@@ -64,9 +75,10 @@
         <receiver
             android:name=".MangoPhotoWidgetProvider"
             android:exported="true"
-            android:label="Mango • ذكريات">
+            android:label="Mango Gallery • ذكريات وطقس المعرض">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                <action android:name="com.m3rd.app.WIDGET_REFRESH" />
             </intent-filter>
             <meta-data
                 android:name="android.appwidget.provider"
@@ -76,7 +88,7 @@
         <receiver
             android:name=".MangoQuickWidgetProvider"
             android:exported="true"
-            android:label="Mango • وصول سريع">
+            android:label="Mango Gallery • مركز التحكم والخزنة">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
             </intent-filter>

@@ -8,6 +8,7 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.hardware.biometrics.BiometricManager
 import android.hardware.biometrics.BiometricPrompt
@@ -25,6 +26,7 @@ import android.util.Base64
 import android.util.LruCache
 import android.view.GestureDetector
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
@@ -43,17 +45,21 @@ import android.widget.Toast
 import android.widget.VideoView
 import java.security.MessageDigest
 import java.security.SecureRandom
+import java.util.Locale
 import java.util.concurrent.Executors
 import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.PBEKeySpec
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
 /**
- * الخزنة الخاصة في Mango Gallery.
- * - كلمة سر مستقلة (PBKDF2 + salt) + سؤال أمان لاسترجاعها + بصمة/وجه (حسب الجهاز).
- * - الملفات مشفّرة (انظر PrivateVault) ولا تظهر في المعرض أو التطبيقات الأخرى.
- * - FLAG_SECURE دائماً + قفل تلقائي عند الخروج من الشاشة.
+ * الخزنة الخاصة الاحترافية في Mango Gallery (Mango Secure Vault).
+ * - خزنة معزولة ومشفّرة بـ AES-256-GCM (وليست قفلاً للمعرض بالكامل)، تنقل إليها الصور والفيديوهات الخاصة فتختفي من المعرض.
+ * - لوحة مفاتيح PIN تفاعلية فاخرة + صفحة مخصصة كاملة لتعديل كلمة المرور وسؤال الأمان وإعدادات البصمة.
+ * - دعم تلقائي ذكي لكافة أنواع البصمة والقياسات الحيوية في الهاتف:
+ *   بصمة الوجه (Face Unlock)، البصمة الجانبية على زر الباور، البصمة المدمجة في الشاشة، أو البصمة الخلفية.
+ * - FLAG_SECURE مفعّل دائماً لمنع تصوير الشاشة + قفل فوري عند الخروج.
  */
 class VaultActivity : Activity() {
 
@@ -61,6 +67,7 @@ class VaultActivity : Activity() {
         const val EXTRA_IMPORT_URIS = "vault_import_uris"
         const val EXTRA_IMPORT_NAMES = "vault_import_names"
         const val EXTRA_IMPORT_MIMES = "vault_import_mimes"
+        const val EXTRA_OPEN_SECURITY_PAGE = "vault_open_security_page"
         private const val REQ_DELETE_ORIGINALS = 4711
         private const val REQ_PICK = 4712
         private val QUESTIONS = arrayOf(
@@ -72,12 +79,16 @@ class VaultActivity : Activity() {
         )
     }
 
-    private val accent = 0xFFFF9800.toInt()
-    private val bg = 0xFF0E0E10.toInt()
-    private val card = 0xFF1C1C20.toInt()
-    private val textPrimary = 0xFFF5F5F7.toInt()
-    private val textSecondary = 0xFF98989E.toInt()
-    private val danger = 0xFFFF5A52.toInt()
+    private val accent = 0xFF0A78D6.toInt()
+    private val accentLight = 0xFF8CD0FA.toInt()
+    private val mangoOrange = 0xFFFF9800.toInt()
+    private val bg = 0xFF07090E.toInt()
+    private val card = 0xFF151922.toInt()
+    private val border = 0xFF252C3A.toInt()
+    private val textPrimary = 0xFFF5F7FA.toInt()
+    private val textSecondary = 0xFF98A1B3.toInt()
+    private val danger = 0xFFFF453A.toInt()
+    private val successGreen = 0xFF32D74B.toInt()
 
     private val handler = Handler(Looper.getMainLooper())
     private val io = Executors.newFixedThreadPool(2)
@@ -86,20 +97,25 @@ class VaultActivity : Activity() {
 
     private var busyExternal = false
     private var unlocked = false
+    private var openSecurityAfterUnlock = false
+    private var filterMode = 0 // 0 = الكل، 1 = صور، 2 = فيديو
     private var pendingUris: ArrayList<Uri> = ArrayList()
     private var pendingNames: ArrayList<String> = ArrayList()
     private var pendingMimes: ArrayList<String> = ArrayList()
 
+    private var allEntries: List<VaultEntry> = emptyList()
     private var entries: List<VaultEntry> = emptyList()
     private val selected = LinkedHashSet<String>()
     private var gridAdapter: GridAdapter? = null
     private var titleView: TextView? = null
+    private var statsSubtitleView: TextView? = null
     private var selectionBar: LinearLayout? = null
-    private var emptyView: TextView? = null
+    private var emptyView: LinearLayout? = null
 
     private var viewerLayer: FrameLayout? = null
     private var viewerIndex = 0
     private var viewerVideo: VideoView? = null
+    private var securityPageOpen = false
 
     private val thumbCache = object : LruCache<String, Bitmap>(
         max(2, (Runtime.getRuntime().maxMemory() / 16).toInt() / 1024).coerceAtMost(24 * 1024)
@@ -107,10 +123,11 @@ class VaultActivity : Activity() {
         override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount / 1024
     }
 
-    // ============================================================ دورة الحياة
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+        window.statusBarColor = bg
+        window.navigationBarColor = bg
         prefs = getSharedPreferences("mango_vault", MODE_PRIVATE)
         root = FrameLayout(this)
         root.setBackgroundColor(bg)
@@ -119,13 +136,13 @@ class VaultActivity : Activity() {
         intent?.getParcelableArrayListExtra<Uri>(EXTRA_IMPORT_URIS)?.let { pendingUris = it }
         intent?.getStringArrayListExtra(EXTRA_IMPORT_NAMES)?.let { pendingNames = it }
         intent?.getStringArrayListExtra(EXTRA_IMPORT_MIMES)?.let { pendingMimes = it }
+        openSecurityAfterUnlock = intent?.getBooleanExtra(EXTRA_OPEN_SECURITY_PAGE, false) == true
 
         if (hasPin()) showLock() else showSetup()
     }
 
     override fun onStop() {
         super.onStop()
-        // قفل تلقائي: أي خروج من الشاشة (إلا الحوارات الخارجية التي بدأناها) يغلق الخزنة
         if (!busyExternal && !isChangingConfigurations) finish()
     }
 
@@ -140,7 +157,14 @@ class VaultActivity : Activity() {
     override fun onBackPressed() {
         when {
             viewerLayer != null -> closeViewer()
-            selected.isNotEmpty() -> { selected.clear(); refreshSelectionUi() }
+            securityPageOpen -> {
+                securityPageOpen = false
+                showMain()
+            }
+            selected.isNotEmpty() -> {
+                selected.clear()
+                refreshSelectionUi()
+            }
             else -> super.onBackPressed()
         }
     }
@@ -164,15 +188,15 @@ class VaultActivity : Activity() {
             if (center) gravity = Gravity.CENTER
         }
 
-    private fun button(t: String, filled: Boolean, onClick: () -> Unit): TextView =
+    private fun button(t: String, filled: Boolean, primaryColor: Int = accent, onClick: () -> Unit): TextView =
         TextView(this).apply {
             text = t
-            textSize = 16f
+            textSize = 15.5f
             typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
-            setTextColor(if (filled) Color.BLACK else accent)
-            background = if (filled) roundBg(accent, 14f) else roundBg(Color.TRANSPARENT, 14f, accent)
-            setPadding(dp(16), dp(14), dp(16), dp(14))
+            setTextColor(Color.WHITE)
+            background = if (filled) roundBg(primaryColor, 16f) else roundBg(card, 16f, border)
+            setPadding(dp(16), dp(13), dp(16), dp(13))
             isClickable = true
             setOnClickListener { onClick() }
         }
@@ -182,11 +206,11 @@ class VaultActivity : Activity() {
             this.hint = hint
             setHintTextColor(textSecondary)
             setTextColor(textPrimary)
-            textSize = 20f
+            textSize = 19f
             gravity = Gravity.CENTER
             inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
             filters = arrayOf(InputFilter.LengthFilter(12))
-            background = roundBg(card, 14f, 0xFF2E2E34.toInt())
+            background = roundBg(card, 16f, border)
             setPadding(dp(14), dp(14), dp(14), dp(14))
         }
 
@@ -195,9 +219,9 @@ class VaultActivity : Activity() {
             this.hint = hint
             setHintTextColor(textSecondary)
             setTextColor(textPrimary)
-            textSize = 16f
+            textSize = 15.5f
             inputType = InputType.TYPE_CLASS_TEXT
-            background = roundBg(card, 14f, 0xFF2E2E34.toInt())
+            background = roundBg(card, 16f, border)
             setPadding(dp(14), dp(14), dp(14), dp(14))
         }
 
@@ -212,7 +236,7 @@ class VaultActivity : Activity() {
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(dp(28), dp(48), dp(28), dp(32))
+            setPadding(dp(24), dp(38), dp(24), dp(28))
         }
         col.build()
         return ScrollView(this).apply {
@@ -221,16 +245,21 @@ class VaultActivity : Activity() {
         }
     }
 
-    private fun lockBadge(): View =
-        TextView(this).apply {
-            text = "🔒"
-            textSize = 34f
-            gravity = Gravity.CENTER
-            background = roundBg(card, 36f, accent)
-            layoutParams = LinearLayout.LayoutParams(dp(76), dp(76))
+    private fun lockBadge(): View {
+        val halo = FrameLayout(this).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(0x260A78D6)
+                setStroke(dp(1), accentLight)
+            }
+            layoutParams = LinearLayout.LayoutParams(dp(80), dp(80))
         }
+        val ic = MainActivity.SamsungIconView(this, MainActivity.SamsungIconView.IconType.LOCK, accentLight, 2.2f)
+        halo.addView(ic, FrameLayout.LayoutParams(dp(34), dp(34), Gravity.CENTER))
+        return halo
+    }
 
-    // ============================================================ كلمة السر
+    // ============================================================ كلمة السر والتشفير
     private fun hasPin(): Boolean = prefs.getString("pin_hash", null) != null
 
     private fun pbkdf2(secret: String, salt: ByteArray, algo: String): String {
@@ -251,10 +280,13 @@ class VaultActivity : Activity() {
             .putString("pin_salt", Base64.encodeToString(salt, Base64.NO_WRAP))
             .putString("pin_algo", algo)
             .putString("pin_hash", pbkdf2(pin, salt, algo))
+            .putInt("pin_len", pin.length)
             .putInt("fails", 0)
             .putLong("lock_until", 0L)
             .apply()
     }
+
+    private fun storedPinLength(): Int = prefs.getInt("pin_len", 4).coerceIn(4, 12)
 
     private fun sameHash(a: String, b: String): Boolean =
         MessageDigest.isEqual(a.toByteArray(), b.toByteArray())
@@ -266,7 +298,7 @@ class VaultActivity : Activity() {
         return try { sameHash(pbkdf2(pin, salt, algo), stored) } catch (e: Throwable) { false }
     }
 
-    private fun normalizeAnswer(a: String): String = a.trim().lowercase()
+    private fun normalizeAnswer(a: String): String = a.trim().lowercase(Locale.ROOT)
 
     private fun storeAnswer(question: String, answer: String) {
         val salt = newSalt()
@@ -303,20 +335,53 @@ class VaultActivity : Activity() {
         prefs.edit().putInt("fails", 0).putLong("lock_until", 0L).apply()
     }
 
-    // ================================================================ البصمة
-    private fun biometricAvailable(): Boolean {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return false
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            return packageManager.hasSystemFeature(PackageManager.FEATURE_FINGERPRINT)
+    // ================================================================ فحص البصمة والقياسات الحيوية الذكي
+    data class BiometricHardwareInfo(
+        val available: Boolean,
+        val hasFingerprint: Boolean,
+        val hasFace: Boolean,
+        val hasIris: Boolean,
+        val sensorDescriptionAr: String
+    )
+
+    private fun detectBiometricHardware(): BiometricHardwareInfo {
+        val pm = packageManager
+        val hasFp = pm.hasSystemFeature(PackageManager.FEATURE_FINGERPRINT)
+        val hasFace = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            pm.hasSystemFeature(PackageManager.FEATURE_FACE)
+        } else false
+        val hasIris = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            pm.hasSystemFeature(PackageManager.FEATURE_IRIS)
+        } else false
+
+        var canAuth = false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                val bm = getSystemService(BiometricManager::class.java)
+                if (bm != null) {
+                    val res = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        bm.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG or BiometricManager.Authenticators.BIOMETRIC_WEAK)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        bm.canAuthenticate()
+                    }
+                    canAuth = (res == BiometricManager.BIOMETRIC_SUCCESS)
+                }
+            } catch (_: Throwable) {}
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            canAuth = hasFp
         }
-        return try {
-            val bm = getSystemService(BiometricManager::class.java)
-            @Suppress("DEPRECATION")
-            bm != null && bm.canAuthenticate() == BiometricManager.BIOMETRIC_SUCCESS
-        } catch (e: Throwable) {
-            false
+
+        val desc = when {
+            hasFp && hasFace -> "بصمة الإصبع (شاشة/جانبية/خلفية) + بصمة الوجه"
+            hasFace -> "التعرف على الوجه (Face Unlock)"
+            hasFp -> "مستشعر بصمة الإصبع (مدمج بالشاشة / جانبي / خلفي)"
+            else -> "القياسات الحيوية للجهاز"
         }
+        return BiometricHardwareInfo(canAuth, hasFp, hasFace, hasIris, desc)
     }
+
+    private fun biometricAvailable(): Boolean = detectBiometricHardware().available
 
     private fun promptBiometric(subtitle: String, onOk: () -> Unit, onFail: (String) -> Unit) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
@@ -325,21 +390,36 @@ class VaultActivity : Activity() {
         }
         try {
             busyExternal = true
-            val prompt = BiometricPrompt.Builder(this)
-                .setTitle("الخزنة الخاصة")
+            val bioInfo = detectBiometricHardware()
+            val builder = BiometricPrompt.Builder(this)
+                .setTitle("الخزنة الخاصة • Mango Gallery")
                 .setSubtitle(subtitle)
-                .setNegativeButton("استخدام كلمة السر", mainExecutor) { _, _ -> }
-                .build()
+                .setDescription(bioInfo.sensorDescriptionAr)
+                .setNegativeButton("إدخال رمز PIN", mainExecutor) { _, _ ->
+                    handler.post { busyExternal = false }
+                }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                builder.setAllowedAuthenticators(
+                    BiometricManager.Authenticators.BIOMETRIC_STRONG or BiometricManager.Authenticators.BIOMETRIC_WEAK
+                )
+            }
+            val prompt = builder.build()
             prompt.authenticate(
                 CancellationSignal(),
                 mainExecutor,
                 object : BiometricPrompt.AuthenticationCallback() {
                     override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult?) {
-                        handler.post { busyExternal = false; onOk() }
+                        handler.post {
+                            busyExternal = false
+                            onOk()
+                        }
                     }
 
                     override fun onAuthenticationError(errorCode: Int, errString: CharSequence?) {
-                        handler.post { busyExternal = false; onFail(errString?.toString() ?: "") }
+                        handler.post {
+                            busyExternal = false
+                            onFail(errString?.toString() ?: "")
+                        }
                     }
                 }
             )
@@ -349,17 +429,17 @@ class VaultActivity : Activity() {
         }
     }
 
-    // ============================================================= إنشاء الخزنة
+    // ============================================================= إنشاء الخزنة لأول مرة
     private fun showSetup() {
         var chosenQuestion = QUESTIONS[0]
-        val pin1 = pinField("كلمة السر (٤ أرقام على الأقل)")
-        val pin2 = pinField("أعد كتابة كلمة السر")
-        val answer = textField("إجابة سؤال الأمان")
+        val pin1 = pinField("رمز PIN للخزنة (٤ إلى ١٢ رقماً)")
+        val pin2 = pinField("تأكيد رمز PIN")
+        val answer = textField("إجابة سؤال الأمان (لاستعادة كلمة السر)")
         val qBtn = TextView(this).apply {
             text = chosenQuestion + "  ▾"
             textSize = 15f
-            setTextColor(accent)
-            background = roundBg(card, 14f, 0xFF2E2E34.toInt())
+            setTextColor(accentLight)
+            background = roundBg(card, 16f, border)
             setPadding(dp(14), dp(14), dp(14), dp(14))
             setOnClickListener {
                 AlertDialog.Builder(this@VaultActivity)
@@ -371,13 +451,17 @@ class VaultActivity : Activity() {
                     .show()
             }
         }
-        val canBio = biometricAvailable()
-        var useBio = canBio
+        val bioInfo = detectBiometricHardware()
+        var useBio = bioInfo.available
         val bioBtn = TextView(this).apply {
-            textSize = 15f
+            textSize = 14.5f
             setTextColor(textPrimary)
-            setPadding(dp(4), dp(10), dp(4), dp(10))
-            fun refresh() { text = if (useBio) "☑  السماح بالفتح بالبصمة / الوجه" else "☐  السماح بالفتح بالبصمة / الوجه" }
+            background = roundBg(card, 16f, border)
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            fun refresh() {
+                text = if (useBio) "✓  تفعيل الفتح السريع: ${bioInfo.sensorDescriptionAr}"
+                else "☐  تفعيل الفتح السريع: ${bioInfo.sensorDescriptionAr}"
+            }
             refresh()
             setOnClickListener { useBio = !useBio; refresh() }
         }
@@ -385,40 +469,40 @@ class VaultActivity : Activity() {
 
         setScreen(centeredPage {
             addView(lockBadge())
-            addView(gap(16))
-            addView(label("إنشاء الخزنة الخاصة", 22f, textPrimary, bold = true, center = true))
+            addView(gap(14))
+            addView(label("إعداد الخزنة الخاصة المشفّرة", 22f, textPrimary, bold = true, center = true))
             addView(gap(6))
             addView(
                 label(
-                    "الصور والفيديوهات اللي تحطها هنا بتتشفّر وبتختفي من المعرض والتطبيقات التانية.",
+                    "المعرض بالكامل يظل مفتوحاً وسريعاً، بينما الصور والفيديوهات التي تنقلها إلى هنا تُشفّر بـ AES-256 وتختفي تماماً من المعرض والتطبيقات الأخرى.",
                     13.5f, textSecondary, center = true
                 )
             )
-            addView(gap(22))
+            addView(gap(20))
             addView(pin1, LinearLayout.LayoutParams(-1, -2))
             addView(gap(10))
             addView(pin2, LinearLayout.LayoutParams(-1, -2))
-            addView(gap(18))
-            addView(label("سؤال الأمان (لاسترجاع كلمة السر لو نسيتها)", 13f, textSecondary))
+            addView(gap(16))
+            addView(label("سؤال الأمان الاحتياطي (لاسترجاع كلمة السر عند نسيانها)", 13f, textSecondary))
             addView(gap(6))
             addView(qBtn, LinearLayout.LayoutParams(-1, -2))
             addView(gap(10))
             addView(answer, LinearLayout.LayoutParams(-1, -2))
-            if (canBio) {
-                addView(gap(8))
-                addView(bioBtn)
+            if (bioInfo.available) {
+                addView(gap(12))
+                addView(bioBtn, LinearLayout.LayoutParams(-1, -2))
             }
             addView(gap(10))
             addView(err)
             addView(gap(10))
-            addView(button("إنشاء الخزنة", true) {
-                val p1 = pin1.text.toString()
-                val p2 = pin2.text.toString()
+            addView(button("تفعيل الخزنة الخاصة 🔒", true, accent) {
+                val p1 = pin1.text.toString().trim()
+                val p2 = pin2.text.toString().trim()
                 val a = answer.text.toString()
                 when {
-                    p1.length < 4 -> err.text = "كلمة السر لازم تكون ٤ أرقام على الأقل"
-                    p1 != p2 -> err.text = "كلمتا السر مش متطابقتين"
-                    normalizeAnswer(a).length < 2 -> err.text = "اكتب إجابة سؤال الأمان"
+                    p1.length < 4 -> err.text = "رمز PIN يجب أن يتكون من ٤ أرقام على الأقل"
+                    p1 != p2 -> err.text = "رمزا PIN غير متطابقين"
+                    normalizeAnswer(a).length < 2 -> err.text = "يرجى إدخال إجابة سؤال الأمان"
                     else -> {
                         storePin(p1)
                         storeAnswer(chosenQuestion, a)
@@ -430,72 +514,215 @@ class VaultActivity : Activity() {
         })
     }
 
-    // ============================================================== شاشة القفل
+    // ============================================================== شاشة القفل الفاخرة بلوحة PIN والبصمة
     private fun showLock() {
-        val pin = pinField("كلمة السر")
-        val err = label("", 13f, danger, center = true)
-        fun tryUnlock() {
-            val wait = lockoutRemainingMs()
-            if (wait > 0) {
-                err.text = "محاولات كتير غلط. استنى ${(wait / 1000) + 1} ثانية"
-                return
-            }
-            if (checkPin(pin.text.toString())) {
-                resetFails()
-                onUnlocked()
-            } else {
-                registerFail()
-                pin.setText("")
-                val w2 = lockoutRemainingMs()
-                err.text = if (w2 > 0) "تم القفل مؤقتاً ${(w2 / 1000) + 1} ثانية" else "كلمة السر غلط"
+        val bioInfo = detectBiometricHardware()
+        val useBio = prefs.getBoolean("biometric", true) && bioInfo.available
+        val targetLen = storedPinLength()
+        var enteredPin = ""
+
+        val page = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TOP_BOTTOM,
+                intArrayOf(0xFF071529.toInt(), 0xFF090C14.toInt(), 0xFF05060A.toInt())
+            )
+            setPadding(dp(24), dp(42), dp(24), dp(22))
+        }
+
+        val topCloseRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        topCloseRow.addView(iconButton("✕") { finish() })
+        topCloseRow.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+        page.addView(topCloseRow, LinearLayout.LayoutParams(-1, -2))
+
+        page.addView(lockBadge())
+        page.addView(gap(12))
+        page.addView(label("الخزنة الخاصة", 23f, Color.WHITE, bold = true, center = true))
+        val statusTv = label(
+            if (useBio) "أدخل رمز الخزنة أو استخدم ${bioInfo.sensorDescriptionAr}"
+            else "أدخل رمز PIN لفتح الخزنة المشفّرة",
+            13f, accentLight, center = true
+        )
+        page.addView(statusTv, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
+
+        val dotsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+        val dotViews = Array(targetLen.coerceIn(4, 8)) {
+            View(this).apply {
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    setColor(Color.TRANSPARENT)
+                    setStroke(dp(2), 0xFF5C7496.toInt())
+                }
             }
         }
-        val useBio = prefs.getBoolean("biometric", false) && biometricAvailable()
-        setScreen(centeredPage {
-            addView(lockBadge())
-            addView(gap(16))
-            addView(label("الخزنة الخاصة", 22f, textPrimary, bold = true, center = true))
-            addView(gap(24))
-            addView(pin, LinearLayout.LayoutParams(-1, -2))
-            addView(gap(8))
-            addView(err)
-            addView(gap(10))
-            addView(button("فتح", true) { tryUnlock() }, LinearLayout.LayoutParams(-1, -2))
-            if (useBio) {
-                addView(gap(10))
-                addView(button("🔓  بصمة / وجه", false) {
-                    promptBiometric("افتح الخزنة", { resetFails(); onUnlocked() }, { m -> err.text = m })
-                }, LinearLayout.LayoutParams(-1, -2))
-            }
-            addView(gap(16))
-            addView(
-                label("نسيت كلمة السر؟", 14f, accent, center = true).apply {
-                    setOnClickListener { showForgot() }
-                    setPadding(dp(10), dp(10), dp(10), dp(10))
+        for (dv in dotViews) {
+            dotsRow.addView(dv, LinearLayout.LayoutParams(dp(15), dp(15)).apply {
+                setMargins(dp(8), dp(20), dp(8), dp(14))
+            })
+        }
+        page.addView(dotsRow, LinearLayout.LayoutParams(-1, -2))
+
+        fun refreshDots(isError: Boolean = false) {
+            for (i in dotViews.indices) {
+                val filled = i < enteredPin.length
+                dotViews[i].background = GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    when {
+                        isError -> setColor(danger)
+                        filled -> setColor(accentLight)
+                        else -> {
+                            setColor(Color.TRANSPARENT)
+                            setStroke(dp(2), 0xFF5C7496.toInt())
+                        }
+                    }
                 }
-            )
-        })
+            }
+        }
+
+        fun onDigit(d: String) {
+            val wait = lockoutRemainingMs()
+            if (wait > 0L) {
+                statusTv.text = "محاولات خاطئة متعددة، انتظر ${(wait / 1000) + 1} ثانية"
+                statusTv.setTextColor(danger)
+                return
+            }
+            if (enteredPin.length < 12) {
+                enteredPin += d
+                refreshDots(false)
+                if (enteredPin.length >= targetLen && checkPin(enteredPin)) {
+                    resetFails()
+                    onUnlocked()
+                    return
+                }
+                if (enteredPin.length >= targetLen) {
+                    registerFail()
+                    try { root.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS) } catch (_: Throwable) {}
+                    refreshDots(true)
+                    val w2 = lockoutRemainingMs()
+                    statusTv.text = if (w2 > 0L) "تم القفل مؤقتاً ${(w2 / 1000) + 1} ثانية" else "رمز PIN غير صحيح"
+                    statusTv.setTextColor(danger)
+                    handler.postDelayed({
+                        enteredPin = ""
+                        refreshDots(false)
+                    }, 300L)
+                }
+            }
+        }
+
+        page.addView(View(this), LinearLayout.LayoutParams(1, 0, 1f))
+
+        // لوحة أرقام دائرية احترافية
+        val keypad = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+        val rows = arrayOf(
+            arrayOf("1", "2", "3"),
+            arrayOf("4", "5", "6"),
+            arrayOf("7", "8", "9"),
+            arrayOf("BIO", "0", "DEL")
+        )
+        for (r in rows) {
+            val rowLayout = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER
+                layoutDirection = View.LAYOUT_DIRECTION_LTR
+            }
+            for (k in r) {
+                val cell = FrameLayout(this).apply {
+                    isClickable = true
+                    background = GradientDrawable().apply {
+                        shape = GradientDrawable.OVAL
+                        setColor(if (k == "BIO") 0x330A78D6 else 0x1AFFFFFF)
+                        setStroke(dp(1), 0x33FFFFFF)
+                    }
+                }
+                when (k) {
+                    "BIO" -> {
+                        val fp = MainActivity.SamsungIconView(this, MainActivity.SamsungIconView.IconType.FINGERPRINT, accentLight, 2.0f)
+                        cell.addView(fp, FrameLayout.LayoutParams(dp(28), dp(28), Gravity.CENTER))
+                        cell.setOnClickListener {
+                            if (useBio) {
+                                promptBiometric("افتح الخزنة الخاصة", { resetFails(); onUnlocked() }, { m ->
+                                    if (m.isNotBlank()) statusTv.text = m
+                                })
+                            } else {
+                                toast("البصمة غير مفعّلة أو غير مدعومة")
+                            }
+                        }
+                    }
+                    "DEL" -> {
+                        cell.addView(label("⌫", 21f, Color.WHITE, bold = true, center = true), FrameLayout.LayoutParams(-1, -1))
+                        cell.setOnClickListener {
+                            if (enteredPin.isNotEmpty()) {
+                                enteredPin = enteredPin.dropLast(1)
+                                refreshDots(false)
+                            }
+                        }
+                    }
+                    else -> {
+                        cell.addView(label(k, 24f, Color.WHITE, bold = true, center = true), FrameLayout.LayoutParams(-1, -1))
+                        cell.setOnClickListener {
+                            cell.scaleX = 0.9f
+                            cell.scaleY = 0.9f
+                            cell.animate().scaleX(1f).scaleY(1f).setDuration(90L).start()
+                            onDigit(k)
+                        }
+                    }
+                }
+                rowLayout.addView(cell, LinearLayout.LayoutParams(dp(70), dp(70)).apply {
+                    setMargins(dp(14), dp(6), dp(14), dp(6))
+                })
+            }
+            keypad.addView(rowLayout)
+        }
+        page.addView(keypad, LinearLayout.LayoutParams(-1, -2))
+
+        val bottomLinks = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(0, dp(12), 0, 0)
+        }
+        bottomLinks.addView(
+            label("نسيت كلمة السر؟ (سؤال الأمان)", 13.5f, accentLight, bold = true, center = true).apply {
+                setPadding(dp(12), dp(8), dp(12), dp(8))
+                setOnClickListener { showForgot() }
+            }
+        )
+        page.addView(bottomLinks, LinearLayout.LayoutParams(-1, -2))
+
+        setScreen(page)
+
         if (useBio) {
             handler.postDelayed({
                 if (!unlocked && !isFinishing) {
-                    promptBiometric("افتح الخزنة", { resetFails(); onUnlocked() }, { })
+                    promptBiometric("افتح الخزنة الخاصة", { resetFails(); onUnlocked() }, { })
                 }
-            }, 350)
+            }, 300)
         }
     }
 
     private fun showForgot() {
-        val answer = textField("الإجابة")
-        val pin1 = pinField("كلمة سر جديدة")
-        val pin2 = pinField("أعد كتابتها")
+        val answer = textField("إجابة سؤال الأمان")
+        val pin1 = pinField("رمز PIN الجديد (٤ أرقام على الأقل)")
+        val pin2 = pinField("تأكيد رمز PIN الجديد")
         val err = label("", 13f, danger, center = true)
         val q = prefs.getString("q_text", "سؤال الأمان") ?: "سؤال الأمان"
         setScreen(centeredPage {
             addView(lockBadge())
-            addView(gap(16))
-            addView(label("استرجاع كلمة السر", 22f, textPrimary, bold = true, center = true))
+            addView(gap(14))
+            addView(label("استرجاع كلمة سر الخزنة", 22f, textPrimary, bold = true, center = true))
             addView(gap(10))
-            addView(label(q, 15f, accent, bold = true, center = true))
+            addView(label(q, 15f, accentLight, bold = true, center = true))
             addView(gap(14))
             addView(answer, LinearLayout.LayoutParams(-1, -2))
             addView(gap(10))
@@ -505,26 +732,26 @@ class VaultActivity : Activity() {
             addView(gap(8))
             addView(err)
             addView(gap(10))
-            addView(button("تغيير كلمة السر", true) {
+            addView(button("حفظ كلمة السر الجديدة وفتح الخزنة", true, accent) {
                 val wait = lockoutRemainingMs()
                 when {
-                    wait > 0 -> err.text = "استنى ${(wait / 1000) + 1} ثانية"
-                    pin1.text.length < 4 -> err.text = "كلمة السر لازم ٤ أرقام على الأقل"
-                    pin1.text.toString() != pin2.text.toString() -> err.text = "كلمتا السر مش متطابقتين"
+                    wait > 0 -> err.text = "انتظر ${(wait / 1000) + 1} ثانية"
+                    pin1.text.length < 4 -> err.text = "كلمة السر يجب أن تكون ٤ أرقام على الأقل"
+                    pin1.text.toString() != pin2.text.toString() -> err.text = "كلمتا السر غير متطابقتين"
                     !checkAnswer(answer.text.toString()) -> {
                         registerFail()
-                        err.text = "الإجابة غلط"
+                        err.text = "إجابة سؤال الأمان غير صحيحة"
                     }
                     else -> {
-                        storePin(pin1.text.toString())
-                        Toast.makeText(this@VaultActivity, "تم تغيير كلمة السر", Toast.LENGTH_SHORT).show()
+                        storePin(pin1.text.toString().trim())
+                        toast("تم تحديث كلمة السر بنجاح")
                         onUnlocked()
                     }
                 }
             }, LinearLayout.LayoutParams(-1, -2))
             addView(gap(8))
             addView(
-                label("رجوع", 14f, textSecondary, center = true).apply {
+                label("العودة لشاشة القفل", 14f, textSecondary, center = true).apply {
                     setOnClickListener { showLock() }
                     setPadding(dp(10), dp(10), dp(10), dp(10))
                 }
@@ -532,41 +759,194 @@ class VaultActivity : Activity() {
         })
     }
 
-    private fun showChangePinDialog() {
-        val col = LinearLayout(this).apply {
+    // =========================================================== صفحة مخصصة لإدارة كلمة السر والبصمة والأمان
+    private fun showSecuritySettingsPage() {
+        securityPageOpen = true
+        val bioInfo = detectBiometricHardware()
+        var bioEnabled = prefs.getBoolean("biometric", true) && bioInfo.available
+
+        val page = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(10), dp(20), dp(4))
+            setBackgroundColor(bg)
         }
-        val old = pinField("كلمة السر الحالية")
-        val n1 = pinField("كلمة السر الجديدة")
-        val n2 = pinField("أعد كتابتها")
-        col.addView(old, LinearLayout.LayoutParams(-1, -2))
-        col.addView(gap(8))
-        col.addView(n1, LinearLayout.LayoutParams(-1, -2))
-        col.addView(gap(8))
-        col.addView(n2, LinearLayout.LayoutParams(-1, -2))
-        val dlg = AlertDialog.Builder(this)
-            .setTitle("تغيير كلمة السر")
-            .setView(col)
-            .setPositiveButton("حفظ", null)
-            .setNegativeButton("إلغاء", null)
-            .create()
-        dlg.setOnShowListener {
-            dlg.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                when {
-                    lockoutRemainingMs() > 0 -> toast("استنى شوية وحاول تاني")
-                    !checkPin(old.text.toString()) -> { registerFail(); toast("كلمة السر الحالية غلط") }
-                    n1.text.length < 4 -> toast("كلمة السر الجديدة لازم ٤ أرقام على الأقل")
-                    n1.text.toString() != n2.text.toString() -> toast("كلمتا السر مش متطابقتين")
-                    else -> {
-                        storePin(n1.text.toString())
-                        toast("تم تغيير كلمة السر")
-                        dlg.dismiss()
-                    }
-                }
+
+        val topBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(10), dp(34), dp(14), dp(10))
+        }
+        topBar.addView(iconButton("‹") {
+            securityPageOpen = false
+            showMain()
+        })
+        topBar.addView(
+            label("إدارة كلمة السر والحماية البيومترية", 18f, textPrimary, bold = true),
+            LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(8) }
+        )
+        page.addView(topBar, LinearLayout.LayoutParams(-1, -2))
+
+        val scroll = ScrollView(this).apply { isFillViewport = true }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(8), dp(16), dp(28))
+        }
+
+        // بطاقة حالة التشفير والبصمة المكتشفة في الهاتف
+        val statusCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = roundBg(card, 20f, border)
+            setPadding(dp(18), dp(16), dp(18), dp(16))
+        }
+        statusCard.addView(label("🛡️ حالة أمان الخزنة الخاصة", 16f, accentLight, bold = true))
+        statusCard.addView(gap(6))
+        statusCard.addView(label("• التشفير النشط: AES-256-GCM عبر Android Keystore", 13.5f, textPrimary))
+        statusCard.addView(gap(4))
+        statusCard.addView(label("• حماية الشاشة: منع اللقطات والتسجيل (FLAG_SECURE)", 13.5f, textPrimary))
+        statusCard.addView(gap(4))
+        statusCard.addView(
+            label(
+                "• مستشعر البصمة في هاتفك: ${if (bioInfo.available) bioInfo.sensorDescriptionAr else "غير مفعّل في إعدادات النظام"}",
+                13.5f,
+                if (bioInfo.available) successGreen else mangoOrange
+            )
+        )
+        content.addView(statusCard, LinearLayout.LayoutParams(-1, -2))
+        content.addView(gap(14))
+
+        // بطاقة تفعيل/إيقاف البصمة (بصمة وجه / جانبية / خلفية / شاشة)
+        val bioCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = roundBg(card, 20f, border)
+            setPadding(dp(18), dp(16), dp(18), dp(16))
+        }
+        bioCard.addView(label("🔓 الفتح بالبصمة والتعرف الحيوي", 16f, textPrimary, bold = true))
+        bioCard.addView(gap(4))
+        bioCard.addView(
+            label(
+                "يدعم الهاتف تلقائياً بصمة الوجه أو البصمة الجانبية أو الخلفية أو المدمجة في الشاشة حسب عتاد جهازك.",
+                13f, textSecondary
+            )
+        )
+        bioCard.addView(gap(12))
+        val bioToggleBtn = button(
+            if (bioEnabled) "✓ الفتح بالبصمة مفعّل (اضغط للإيقاف)" else "تفعيل الفتح بالبصمة الآن",
+            bioEnabled,
+            if (bioEnabled) accent else card
+        ) {}
+        bioToggleBtn.setOnClickListener {
+            if (!bioInfo.available) {
+                toast("يرجى تسجيل بصمة أو وجه في إعدادات الهاتف أولاً")
+                return@setOnClickListener
+            }
+            if (bioEnabled) {
+                bioEnabled = false
+                prefs.edit().putBoolean("biometric", false).apply()
+                toast("تم إيقاف الفتح بالبصمة")
+                showSecuritySettingsPage()
+            } else {
+                promptBiometric("تأكيد تفعيل البصمة للخزنة", {
+                    bioEnabled = true
+                    prefs.edit().putBoolean("biometric", true).apply()
+                    toast("تم تفعيل الفتح بالبصمة بنجاح")
+                    showSecuritySettingsPage()
+                }, { err -> if (err.isNotBlank()) toast(err) })
             }
         }
-        dlg.show()
+        bioCard.addView(bioToggleBtn, LinearLayout.LayoutParams(-1, -2))
+        content.addView(bioCard, LinearLayout.LayoutParams(-1, -2))
+        content.addView(gap(14))
+
+        // بطاقة تعديل كلمة المرور / رمز PIN
+        val pinCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = roundBg(card, 20f, border)
+            setPadding(dp(18), dp(16), dp(18), dp(16))
+        }
+        pinCard.addView(label("🔑 تعديل كلمة المرور (رمز PIN)", 16f, textPrimary, bold = true))
+        pinCard.addView(gap(10))
+        val oldPinInput = pinField("كلمة السر الحالية")
+        val newPin1Input = pinField("كلمة السر الجديدة (٤ إلى ١٢ رقماً)")
+        val newPin2Input = pinField("تأكيد كلمة السر الجديدة")
+        pinCard.addView(oldPinInput, LinearLayout.LayoutParams(-1, -2))
+        pinCard.addView(gap(8))
+        pinCard.addView(newPin1Input, LinearLayout.LayoutParams(-1, -2))
+        pinCard.addView(gap(8))
+        pinCard.addView(newPin2Input, LinearLayout.LayoutParams(-1, -2))
+        pinCard.addView(gap(12))
+        pinCard.addView(button("حفظ كلمة المرور الجديدة", true, accent) {
+            val oldP = oldPinInput.text.toString().trim()
+            val n1 = newPin1Input.text.toString().trim()
+            val n2 = newPin2Input.text.toString().trim()
+            when {
+                lockoutRemainingMs() > 0 -> toast("يرجى الانتظار قليلاً قبل المحاولة")
+                !checkPin(oldP) -> {
+                    registerFail()
+                    toast("كلمة السر الحالية غير صحيحة")
+                }
+                n1.length < 4 -> toast("كلمة السر الجديدة يجب أن تكون ٤ أرقام على الأقل")
+                n1 != n2 -> toast("كلمتا السر الجديدتان غير متطابقتين")
+                else -> {
+                    storePin(n1)
+                    oldPinInput.setText("")
+                    newPin1Input.setText("")
+                    newPin2Input.setText("")
+                    toast("تم تحديث كلمة المرور بنجاح 🔒")
+                }
+            }
+        }, LinearLayout.LayoutParams(-1, -2))
+        content.addView(pinCard, LinearLayout.LayoutParams(-1, -2))
+        content.addView(gap(14))
+
+        // بطاقة تحديث سؤال الأمان الاحتياطي
+        val qCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = roundBg(card, 20f, border)
+            setPadding(dp(18), dp(16), dp(18), dp(16))
+        }
+        var chosenQ = prefs.getString("q_text", QUESTIONS[0]) ?: QUESTIONS[0]
+        qCard.addView(label("❓ تحديث سؤال الأمان لاسترجاع كلمة السر", 16f, textPrimary, bold = true))
+        qCard.addView(gap(10))
+        val curPinForQ = pinField("أدخل كلمة السر الحالية للتأكيد")
+        val qSelector = TextView(this).apply {
+            text = chosenQ + "  ▾"
+            textSize = 14.5f
+            setTextColor(accentLight)
+            background = roundBg(bg, 14f, border)
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            setOnClickListener {
+                AlertDialog.Builder(this@VaultActivity)
+                    .setTitle("اختر سؤال الأمان")
+                    .setItems(QUESTIONS) { _, w ->
+                        chosenQ = QUESTIONS[w]
+                        text = chosenQ + "  ▾"
+                    }
+                    .show()
+            }
+        }
+        val newAnsInput = textField("الإجابة الجديدة لسؤال الأمان")
+        qCard.addView(curPinForQ, LinearLayout.LayoutParams(-1, -2))
+        qCard.addView(gap(8))
+        qCard.addView(qSelector, LinearLayout.LayoutParams(-1, -2))
+        qCard.addView(gap(8))
+        qCard.addView(newAnsInput, LinearLayout.LayoutParams(-1, -2))
+        qCard.addView(gap(12))
+        qCard.addView(button("تحديث سؤال الأمان", false) {
+            when {
+                !checkPin(curPinForQ.text.toString().trim()) -> toast("كلمة السر الحالية غير صحيحة")
+                normalizeAnswer(newAnsInput.text.toString()).length < 2 -> toast("يرجى كتابة إجابة واضحة")
+                else -> {
+                    storeAnswer(chosenQ, newAnsInput.text.toString())
+                    curPinForQ.setText("")
+                    newAnsInput.setText("")
+                    toast("تم تحديث سؤال الأمان بنجاح")
+                }
+            }
+        }, LinearLayout.LayoutParams(-1, -2))
+        content.addView(qCard, LinearLayout.LayoutParams(-1, -2))
+
+        scroll.addView(content)
+        page.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+        setScreen(page)
     }
 
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
@@ -578,42 +958,108 @@ class VaultActivity : Activity() {
             val u = ArrayList(pendingUris)
             val n = ArrayList(pendingNames)
             val m = ArrayList(pendingMimes)
-            pendingUris = ArrayList(); pendingNames = ArrayList(); pendingMimes = ArrayList()
+            pendingUris = ArrayList()
+            pendingNames = ArrayList()
+            pendingMimes = ArrayList()
             showMain()
             importUris(u, n, m, deleteOriginals = true)
+        } else if (openSecurityAfterUnlock) {
+            openSecurityAfterUnlock = false
+            showSecuritySettingsPage()
         } else {
             showMain()
         }
     }
 
-    // ================================================================== الرئيسية
+    // ================================================================== الشاشة الرئيسية للخزنة
     private fun showMain() {
+        securityPageOpen = false
         selected.clear()
         val page = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(bg)
         }
+
+        // الشريط العلوي
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(8), dp(34), dp(8), dp(8))
+            setPadding(dp(10), dp(34), dp(10), dp(8))
         }
         bar.addView(iconButton("✕") { finish() })
-        val title = label("الخزنة الخاصة", 19f, textPrimary, bold = true)
+
+        val titleCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(8), 0, dp(8), 0)
+        }
+        val title = label("الخزنة الخاصة 🔒", 19f, textPrimary, bold = true)
+        val sub = label("مشفّرة بـ AES-256 • معزولة عن المعرض", 11.5f, accentLight)
         titleView = title
-        bar.addView(title, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(6); rightMargin = dp(6) })
+        statsSubtitleView = sub
+        titleCol.addView(title)
+        titleCol.addView(sub)
+        bar.addView(titleCol, LinearLayout.LayoutParams(0, -2, 1f))
+
+        bar.addView(iconButton("🔑") { showSecuritySettingsPage() })
         bar.addView(iconButton("＋") { pickFromDevice() })
         bar.addView(iconButton("⋮") { showVaultMenu() })
         page.addView(bar, LinearLayout.LayoutParams(-1, -2))
 
+        // شريط الفلترة السريعة (الكل / الصور / الفيديوهات / إعدادات الأمان)
+        val filterRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(4), dp(12), dp(10))
+        }
+        val filterLabels = arrayOf("الكل", "الصور", "الفيديوهات")
+        val filterBtns = ArrayList<TextView>()
+        fun updateFilterPills() {
+            for (i in filterBtns.indices) {
+                val active = (filterMode == i)
+                filterBtns[i].background = if (active) roundBg(accent, 14f) else roundBg(card, 14f, border)
+                filterBtns[i].setTextColor(if (active) Color.WHITE else textSecondary)
+            }
+        }
+        for (i in filterLabels.indices) {
+            val b = TextView(this).apply {
+                text = filterLabels[i]
+                textSize = 12.5f
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+                setPadding(dp(14), dp(7), dp(14), dp(7))
+                setOnClickListener {
+                    filterMode = i
+                    updateFilterPills()
+                    applyEntriesFilter()
+                }
+            }
+            filterBtns.add(b)
+            filterRow.addView(b, LinearLayout.LayoutParams(-2, -2).apply { rightMargin = dp(6) })
+        }
+        updateFilterPills()
+        filterRow.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+        val secQuickBtn = TextView(this).apply {
+            text = "إعدادات كلمة السر والبصمة ⚙️"
+            textSize = 12f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(accentLight)
+            background = roundBg(card, 14f, border)
+            setPadding(dp(12), dp(7), dp(12), dp(7))
+            setOnClickListener { showSecuritySettingsPage() }
+        }
+        filterRow.addView(secQuickBtn)
+        page.addView(filterRow, LinearLayout.LayoutParams(-1, -2))
+
         val frame = FrameLayout(this)
         val grid = GridView(this).apply {
             numColumns = 3
-            horizontalSpacing = dp(2)
-            verticalSpacing = dp(2)
+            horizontalSpacing = dp(3)
+            verticalSpacing = dp(3)
             stretchMode = GridView.STRETCH_COLUMN_WIDTH
             setBackgroundColor(bg)
-            selector = android.graphics.drawable.ColorDrawable(Color.TRANSPARENT)
+            setPadding(dp(4), 0, dp(4), dp(16))
+            clipToPadding = false
+            selector = ColorDrawable(Color.TRANSPARENT)
         }
         val adapter = GridAdapter()
         gridAdapter = adapter
@@ -628,9 +1074,26 @@ class VaultActivity : Activity() {
             true
         }
         frame.addView(grid, FrameLayout.LayoutParams(-1, -1))
-        val empty = label("الخزنة فاضية\nحدد صور في المعرض واختار «نقل للخزنة»", 15f, textSecondary, center = true)
-        emptyView = empty
-        frame.addView(empty, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
+
+        val emptyCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(dp(32), dp(32), dp(32), dp(32))
+        }
+        emptyCol.addView(lockBadge())
+        emptyCol.addView(gap(14))
+        emptyCol.addView(label("الخزنة الخاصة فارغة حالياً", 17f, textPrimary, bold = true, center = true))
+        emptyCol.addView(gap(6))
+        emptyCol.addView(
+            label(
+                "يمكنك تحديد أي صور أو فيديوهات من المعرض والضغط على «للخزنة» لإخفائها وتشفيرها هنا، أو إضافتها مباشرة بالزر أدناه.",
+                13.5f, textSecondary, center = true
+            )
+        )
+        emptyCol.addView(gap(16))
+        emptyCol.addView(button("＋ إضافة صور أو فيديو للخزنة", true, accent) { pickFromDevice() })
+        emptyView = emptyCol
+        frame.addView(emptyCol, FrameLayout.LayoutParams(-1, -2, Gravity.CENTER))
         page.addView(frame, LinearLayout.LayoutParams(-1, 0, 1f))
 
         val sel = LinearLayout(this).apply {
@@ -640,7 +1103,7 @@ class VaultActivity : Activity() {
             visibility = View.GONE
         }
         sel.addView(
-            button("استعادة للمعرض", true) { restoreSelected() },
+            button("استعادة للمعرض", true, accent) { restoreSelected() },
             LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(6) }
         )
         sel.addView(
@@ -657,10 +1120,10 @@ class VaultActivity : Activity() {
     private fun iconButton(glyph: String, onClick: () -> Unit): TextView =
         TextView(this).apply {
             text = glyph
-            textSize = 22f
+            textSize = 20f
             setTextColor(textPrimary)
             gravity = Gravity.CENTER
-            setPadding(dp(12), dp(6), dp(12), dp(6))
+            setPadding(dp(10), dp(6), dp(10), dp(6))
             setOnClickListener { onClick() }
         }
 
@@ -669,12 +1132,24 @@ class VaultActivity : Activity() {
             val list = PrivateVault.list(this)
             handler.post {
                 if (isFinishing) return@post
-                entries = list
-                gridAdapter?.notifyDataSetChanged()
-                emptyView?.visibility = if (list.isEmpty()) View.VISIBLE else View.GONE
-                refreshSelectionUi()
+                allEntries = list
+                applyEntriesFilter()
             }
         }
+    }
+
+    private fun applyEntriesFilter() {
+        entries = when (filterMode) {
+            1 -> allEntries.filter { !it.isVideo }
+            2 -> allEntries.filter { it.isVideo }
+            else -> allEntries
+        }
+        gridAdapter?.notifyDataSetChanged()
+        emptyView?.visibility = if (entries.isEmpty()) View.VISIBLE else View.GONE
+        val pCount = allEntries.count { !it.isVideo }
+        val vCount = allEntries.count { it.isVideo }
+        statsSubtitleView?.text = "$pCount صورة • $vCount فيديو • مشفّرة بـ AES-256"
+        refreshSelectionUi()
     }
 
     private fun toggleSelect(id: String) {
@@ -685,77 +1160,35 @@ class VaultActivity : Activity() {
 
     private fun refreshSelectionUi() {
         selectionBar?.visibility = if (selected.isEmpty()) View.GONE else View.VISIBLE
-        titleView?.text = if (selected.isEmpty()) "الخزنة الخاصة (${entries.size})" else "تم تحديد ${selected.size}"
+        titleView?.text = if (selected.isEmpty()) {
+            "الخزنة الخاصة (${entries.size})"
+        } else {
+            "تم تحديد ${selected.size}"
+        }
         gridAdapter?.notifyDataSetChanged()
     }
 
     private fun showVaultMenu() {
-        val bio = prefs.getBoolean("biometric", false)
-        val canBio = biometricAvailable()
-        val items = ArrayList<String>()
-        items.add("تغيير كلمة السر")
-        items.add("تغيير سؤال الأمان")
-        if (canBio) items.add(if (bio) "إيقاف الفتح بالبصمة" else "تفعيل الفتح بالبصمة")
-        items.add("قفل الآن")
+        val items = arrayOf(
+            "صفحة تعديل كلمة السر والبصمة وسؤال الأمان",
+            "إضافة صور أو فيديوهات إلى الخزنة",
+            "تحديد كل العناصر",
+            "قفل الخزنة الآن"
+        )
         AlertDialog.Builder(this)
-            .setItems(items.toTypedArray()) { _, which ->
-                when (items[which]) {
-                    "تغيير كلمة السر" -> showChangePinDialog()
-                    "تغيير سؤال الأمان" -> showChangeQuestionDialog()
-                    "قفل الآن" -> finish()
-                    else -> {
-                        if (bio) {
-                            prefs.edit().putBoolean("biometric", false).apply()
-                            toast("تم إيقاف البصمة")
-                        } else {
-                            promptBiometric("تأكيد تفعيل البصمة", {
-                                prefs.edit().putBoolean("biometric", true).apply()
-                                toast("تم تفعيل البصمة")
-                            }, { m -> toast(m) })
-                        }
+            .setTitle("خيارات الخزنة الخاصة")
+            .setItems(items) { _, which ->
+                when (which) {
+                    0 -> showSecuritySettingsPage()
+                    1 -> pickFromDevice()
+                    2 -> {
+                        selected.clear()
+                        entries.forEach { selected.add(it.id) }
+                        refreshSelectionUi()
                     }
+                    3 -> finish()
                 }
             }
-            .show()
-    }
-
-    private fun showChangeQuestionDialog() {
-        var chosen = QUESTIONS[0]
-        val col = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(10), dp(20), dp(4))
-        }
-        val pin = pinField("كلمة السر الحالية")
-        val ans = textField("الإجابة الجديدة")
-        val q = TextView(this).apply {
-            text = chosen + "  ▾"
-            textSize = 15f
-            setTextColor(accent)
-            setPadding(dp(4), dp(12), dp(4), dp(12))
-            setOnClickListener {
-                AlertDialog.Builder(this@VaultActivity).setItems(QUESTIONS) { _, w ->
-                    chosen = QUESTIONS[w]
-                    text = chosen + "  ▾"
-                }.show()
-            }
-        }
-        col.addView(pin, LinearLayout.LayoutParams(-1, -2))
-        col.addView(q)
-        col.addView(ans, LinearLayout.LayoutParams(-1, -2))
-        AlertDialog.Builder(this)
-            .setTitle("تغيير سؤال الأمان")
-            .setView(col)
-            .setPositiveButton("حفظ") { _, _ ->
-                if (!checkPin(pin.text.toString())) {
-                    toast("كلمة السر غلط")
-                } else if (normalizeAnswer(ans.text.toString()).length < 2) {
-                    toast("اكتب إجابة")
-                } else {
-                    storeAnswer(chosen, ans.text.toString())
-                    toast("تم الحفظ")
-                }
-            }
-            .setNegativeButton("إلغاء", null)
             .show()
     }
 
@@ -779,25 +1212,29 @@ class VaultActivity : Activity() {
                 cell = FrameLayout(this@VaultActivity)
                 img = ImageView(this@VaultActivity).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
                 badge = TextView(this@VaultActivity).apply {
-                    text = "▶"
-                    textSize = 12f
+                    text = "▶ فيديو"
+                    textSize = 10.5f
                     setTextColor(Color.WHITE)
-                    setShadowLayer(4f, 0f, 0f, Color.BLACK)
+                    setPadding(dp(6), dp(2), dp(6), dp(2))
+                    background = roundBg(0xAA000000.toInt(), 8f)
                 }
                 check = TextView(this@VaultActivity).apply {
                     gravity = Gravity.CENTER
-                    textSize = 14f
-                    setTextColor(Color.BLACK)
+                    textSize = 13f
+                    typeface = Typeface.DEFAULT_BOLD
+                    setTextColor(Color.WHITE)
                 }
                 cell.addView(img, FrameLayout.LayoutParams(-1, -1))
                 cell.addView(badge, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.START).apply {
-                    leftMargin = dp(6); bottomMargin = dp(4)
+                    leftMargin = dp(6)
+                    bottomMargin = dp(6)
                 })
                 cell.addView(check, FrameLayout.LayoutParams(dp(22), dp(22), Gravity.TOP or Gravity.END).apply {
-                    topMargin = dp(6); rightMargin = dp(6)
+                    topMargin = dp(6)
+                    rightMargin = dp(6)
                 })
             }
-            val size = (resources.displayMetrics.widthPixels - dp(4)) / 3
+            val size = (resources.displayMetrics.widthPixels - dp(16)) / 3
             cell.layoutParams = AbsListView.LayoutParams(size, size)
 
             val e = entries[position]
@@ -807,7 +1244,7 @@ class VaultActivity : Activity() {
             check.text = if (isSel) "✓" else ""
             check.background = roundBg(if (isSel) accent else 0x66000000, 11f, Color.WHITE)
             cell.setBackgroundColor(card)
-            img.alpha = if (isSel) 0.6f else 1f
+            img.alpha = if (isSel) 0.65f else 1f
 
             img.tag = e.id
             val cached = thumbCache.get(e.id)
@@ -841,7 +1278,7 @@ class VaultActivity : Activity() {
             startActivityForResult(i, REQ_PICK)
         } catch (e: Throwable) {
             busyExternal = false
-            toast("تعذر فتح المنتقي")
+            toast("تعذر فتح منتقي الملفات")
         }
     }
 
@@ -865,8 +1302,8 @@ class VaultActivity : Activity() {
             }
             importUris(uris, names, mimes, deleteOriginals = false)
         } else if (requestCode == REQ_DELETE_ORIGINALS) {
-            if (resultCode == RESULT_OK) toast("تم حذف الأصول من المعرض")
-            else toast("الأصول لسه موجودة في المعرض")
+            if (resultCode == RESULT_OK) toast("تم إخفاء وحذف النسخ الأصلية من المعرض العام")
+            else toast("تم حفظ النسخ المشفّرة في الخزنة")
         }
     }
 
@@ -887,7 +1324,7 @@ class VaultActivity : Activity() {
     ) {
         if (uris.isEmpty()) return
         val dlg = AlertDialog.Builder(this)
-            .setMessage("جاري التشفير والنقل للخزنة...")
+            .setMessage("جاري تشفير الملفات بـ AES-256 ونقلها إلى الخزنة الخاصة...")
             .setCancelable(false)
             .show()
         io.execute {
@@ -901,7 +1338,7 @@ class VaultActivity : Activity() {
                 try { dlg.dismiss() } catch (_: Throwable) {}
                 if (isFinishing) return@post
                 reloadEntries()
-                if (moved.size == uris.size) toast("تم نقل ${moved.size} للخزنة")
+                if (moved.size == uris.size) toast("تم تأمين ونقل ${moved.size} عنصر للخزنة 🔒")
                 else toast("تم نقل ${moved.size} من ${uris.size}")
                 if (deleteOriginals && moved.isNotEmpty()) deleteOriginalsFromGallery(moved)
             }
@@ -920,11 +1357,11 @@ class VaultActivity : Activity() {
                 for (u in uris) {
                     try { if (contentResolver.delete(u, null, null) <= 0) failed++ } catch (_: Throwable) { failed++ }
                 }
-                if (failed > 0) toast("$failed ملف لسه موجود في المعرض، احذفه يدوياً")
+                if (failed > 0) toast("$failed ملف ما زال ظاهراً في المعرض، يمكنك حذفه يدوياً")
             }
         } catch (e: Throwable) {
             busyExternal = false
-            toast("الصور اتنقلت للخزنة، بس احذف الأصول من المعرض يدوياً")
+            toast("تم حفظ الملفات في الخزنة المشفّرة")
         }
     }
 
@@ -938,7 +1375,7 @@ class VaultActivity : Activity() {
             var ok = 0
             for (e in list) if (PrivateVault.restoreToGallery(this, e)) ok++
             handler.post {
-                toast(if (ok == list.size) "تمت الاستعادة للمعرض" else "تمت استعادة $ok من ${list.size}")
+                toast(if (ok == list.size) "تمت استعادة العناصر إلى المعرض" else "تمت استعادة $ok من ${list.size}")
                 selected.clear()
                 reloadEntries()
             }
@@ -949,9 +1386,9 @@ class VaultActivity : Activity() {
         val list = selectedEntries()
         if (list.isEmpty()) return
         AlertDialog.Builder(this)
-            .setTitle("حذف نهائي")
-            .setMessage("هيتم حذف ${list.size} عنصر نهائياً ومش هينفع تسترجعهم.")
-            .setPositiveButton("حذف") { _, _ ->
+            .setTitle("حذف نهائي من الخزنة")
+            .setMessage("سيتم إتلاف ${list.size} عنصر مشفّر نهائياً ولا يمكن استرجاعها.")
+            .setPositiveButton("حذف نهائي") { _, _ ->
                 io.execute {
                     for (e in list) PrivateVault.delete(this, e)
                     handler.post { selected.clear(); reloadEntries() }
@@ -972,8 +1409,7 @@ class VaultActivity : Activity() {
             override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
                 if (e1 == null) return false
                 val dx = e2.x - e1.x
-                if (kotlin.math.abs(dx) > dp(80) && kotlin.math.abs(vx) > 400) {
-                    // اللغة عربية: السحب لليمين = التالي
+                if (abs(dx) > dp(80) && abs(vx) > 400) {
                     showViewerItem(if (dx > 0) viewerIndex + 1 else viewerIndex - 1)
                     return true
                 }
@@ -994,7 +1430,7 @@ class VaultActivity : Activity() {
         viewerVideo = null
         layer.removeAllViews()
 
-        val spinner = label("جاري فك التشفير...", 14f, textSecondary, center = true)
+        val spinner = label("جاري فك التشفير اللحظي...", 14f, textSecondary, center = true)
         layer.addView(spinner, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
 
         io.execute {
@@ -1003,7 +1439,12 @@ class VaultActivity : Activity() {
                 handler.post {
                     if (viewerLayer !== layer || viewerIndex != rawIndex) return@post
                     layer.removeView(spinner)
-                    if (f == null) { spinner.text = "تعذر فتح الفيديو"; layer.addView(spinner, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER)); addViewerChrome(layer, e); return@post }
+                    if (f == null) {
+                        spinner.text = "تعذر تشغيل الفيديو المشفّر"
+                        layer.addView(spinner, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
+                        addViewerChrome(layer, e)
+                        return@post
+                    }
                     val vv = VideoView(this)
                     viewerVideo = vv
                     layer.addView(vv, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
@@ -1045,17 +1486,19 @@ class VaultActivity : Activity() {
         }
         top.addView(iconButton("✕") { closeViewer() })
         top.addView(
-            label("${viewerIndex + 1} / ${entries.size}", 15f, Color.WHITE, center = true),
+            label("${viewerIndex + 1} / ${entries.size} • ${e.name}", 14f, Color.WHITE, center = true),
             LinearLayout.LayoutParams(0, -2, 1f)
         )
         top.addView(iconButton("↩") {
             closeViewer()
-            selected.clear(); selected.add(e.id)
+            selected.clear()
+            selected.add(e.id)
             restoreSelected()
         })
         top.addView(iconButton("🗑") {
             closeViewer()
-            selected.clear(); selected.add(e.id)
+            selected.clear()
+            selected.add(e.id)
             confirmDeleteSelected()
         })
         layer.addView(top, FrameLayout.LayoutParams(-1, -2, Gravity.TOP))
