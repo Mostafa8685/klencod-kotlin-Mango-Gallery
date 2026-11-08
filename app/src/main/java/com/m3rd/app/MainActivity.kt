@@ -3524,16 +3524,14 @@ class MainActivity : Activity() {
             LinearLayout.LayoutParams(0, -2, 1f)
         )
         row3.addView(
-            makeHamburgerGridItem("إعدادات
-البصمة والقفل", SamsungIconView.IconType.FINGERPRINT) {
+            makeHamburgerGridItem("إعدادات\nالبصمة والقفل", SamsungIconView.IconType.FINGERPRINT) {
                 closeOverlay()
                 openVaultSecuritySettings()
             },
             LinearLayout.LayoutParams(0, -2, 1f)
         )
         row3.addView(
-            makeHamburgerGridItem("مسح أجسام
-بالذكاء AI", SamsungIconView.IconType.ERASER_BOX) {
+            makeHamburgerGridItem("مسح أجسام\nبالذكاء AI", SamsungIconView.IconType.ERASER_BOX) {
                 closeOverlay()
                 val firstPhoto = getVisibleMediaItems().firstOrNull { !it.isVideo }
                 if (firstPhoto != null) {
@@ -3545,8 +3543,7 @@ class MainActivity : Activity() {
             LinearLayout.LayoutParams(0, -2, 1f)
         )
         row3.addView(
-            makeHamburgerGridItem("استوديو
-مونتاج الفيديو", SamsungIconView.IconType.EDIT_PEN) {
+            makeHamburgerGridItem("استوديو\nمونتاج الفيديو", SamsungIconView.IconType.EDIT_PEN) {
                 closeOverlay()
                 val firstVid = getVisibleMediaItems().firstOrNull { it.isVideo }
                 if (firstVid != null) {
@@ -6622,16 +6619,10 @@ class MainActivity : Activity() {
             AlertDialog.Builder(this)
                 .setTitle("المحرك العصبي المحلي (On-Device NPU/CPU)")
                 .setMessage(
-                    "يتم تشغيل نموذج مسح الأجسام محلياً على معالج هاتفك:
-
-" +
-                    "• المعالج: ${hwProfile.chipSummary}
-" +
-                    "• المسرّع: ${hwProfile.acceleratorName}
-" +
-                    "• الوضع التلقائي: ${hwProfile.displayTitleAr}
-
-" +
+                    "يتم تشغيل نموذج مسح الأجسام محلياً على معالج هاتفك:\n\n" +
+                    "• المعالج: ${hwProfile.chipSummary}\n" +
+                    "• المسرّع: ${hwProfile.acceleratorName}\n" +
+                    "• الوضع التلقائي: ${hwProfile.displayTitleAr}\n\n" +
                     "يمكنك استخدام الممحاة الذكية من خلال فتح أي صورة ثم اختيار (تعديل) أو (مسح أجسام بالذكاء الاصطناعي ✨)."
                 )
                 .setPositiveButton("حسناً", null)
